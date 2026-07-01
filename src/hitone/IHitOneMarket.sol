@@ -49,7 +49,18 @@ interface IHitOneMarket {
     event MakerPoolWithdrawalExecuted(uint256 indexed id);
     event MakerPoolWithdrawalCancelled(uint256 indexed id);
 
-    event MarkPushed(address indexed token, uint256 newMark, int256 priceDelta, uint16 timeDelta10ms, bool isSentinel);
+    /// @notice Emitted on every mark set. `microTimestamp` is MegaETH's high-precision wall-clock
+    /// (µs since epoch) read from the system contract, letting off-chain consumers validate that
+    /// each mark was posted at a plausible time; it falls back to `block.timestamp × 1e6` when the
+    /// system contract is unavailable.
+    event MarkPushed(
+        address indexed token,
+        uint256 newMark,
+        int256  priceDelta,
+        uint16  timeDelta10ms,
+        bool    isSentinel,
+        uint256 microTimestamp
+    );
     event FundingRateChanged(address indexed token, int64 oldRate, int64 newRate, uint64 startTime);
 
     /// @notice Off-chain indexers can use `(channel, nonce)` to flag a user order as spent.
@@ -346,7 +357,11 @@ interface IHitOneMarket {
     // maker: liquidation
     // ============================================================
 
-    function liquidate(address token, uint256[] calldata positionIds) external;
+    /// @notice Liquidate `positionIds` on `token`. If `newMark` is non-zero it is first pushed
+    /// as the current mark (identical to `setMark`, including the oracle-band check), so a maker
+    /// can post a price and liquidate against it in a single transaction; the common case is
+    /// liquidating at that just-posted mark. Pass `0` to liquidate against the existing mark.
+    function liquidate(address token, uint256 newMark, uint256[] calldata positionIds) external;
 
     // ============================================================
     // views — ring reconstruction

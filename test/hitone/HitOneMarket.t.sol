@@ -2,6 +2,7 @@
 pragma solidity ^0.8.27;
 
 import { Test }          from "forge-std/Test.sol";
+import { Vm }            from "forge-std/Vm.sol";
 import { Ownable }       from "@openzeppelin/contracts/access/Ownable.sol";
 import { Pausable }      from "@openzeppelin/contracts/utils/Pausable.sol";
 
@@ -9,6 +10,7 @@ import { HitOneMarket }  from "../../src/hitone/HitOneMarket.sol";
 import { IHitOneMarket } from "../../src/hitone/IHitOneMarket.sol";
 import { ParamCatalog }  from "../../src/common/ParamCatalog.sol";
 import { MockERC20 }     from "../mocks/MockERC20.sol";
+import { MockHighPrecisionTimestamp } from "../mocks/MockHighPrecisionTimestamp.sol";
 
 contract HitOneMarketTest is Test {
     HitOneMarket internal h;
@@ -396,11 +398,40 @@ contract HitOneMarketTest is Test {
         uint256[] memory ids = new uint256[](1);
         ids[0] = id;
         vm.prank(maker);
-        h.liquidate(token, ids);
+        h.liquidate(token, 0, ids);          // mark already posted; 0 => liquidate at current mark
         IHitOneMarket.PositionView memory p = h.positions(id);
         assertTrue(p.closed);
         assertEq(p.payoutReceived, 0);
         assertEq(h.activePositionId(alice, token), 0);
+    }
+
+    function test_liquidateWithMarkPush() public {
+        // Post the liquidating mark and wipe in a single call.
+        uint256 id = _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
+        _adv(1);
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = id;
+        vm.prank(maker);
+        h.liquidate(token, 44_000e18, ids);
+        IHitOneMarket.PositionView memory p = h.positions(id);
+        assertTrue(p.closed);
+        assertEq(p.payoutReceived, 0);
+        assertEq(h.activePositionId(alice, token), 0);
+        // the pushed mark stuck as the current mark
+        assertEq(h.marketOf(token).mark, 44_000e18);
+    }
+
+    function test_liquidateMarkPushNotLiquidatableReverts() public {
+        // A non-zero mark still within the solvent range wipes nothing => NoneLiquidated,
+        // and the whole tx (including the mark push) reverts.
+        uint256 id = _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
+        _adv(1);
+        uint256[] memory ids = new uint256[](1);
+        ids[0] = id;
+        vm.prank(maker);
+        vm.expectRevert(IHitOneMarket.NoneLiquidated.selector);
+        h.liquidate(token, 50_500e18, ids);
+        assertEq(h.marketOf(token).mark, 50_000e18, "mark push rolled back with the revert");
     }
 
     function test_liquidateOnlyMaker() public {
@@ -409,7 +440,52 @@ contract HitOneMarketTest is Test {
         ids[0] = id;
         vm.prank(alice);
         vm.expectRevert(IHitOneMarket.NotMaker.selector);
-        h.liquidate(token, ids);
+        h.liquidate(token, 0, ids);
+    }
+
+    // ============================================================
+    // Mark high-precision timestamp (MegaETH system contract)
+    // ============================================================
+
+    address internal constant HP_TIMESTAMP = 0x6342000000000000000000000000000000000002;
+    bytes32 internal constant MARK_PUSHED_SIG =
+        keccak256("MarkPushed(address,uint256,int256,uint16,bool,uint256)");
+
+    function _lastMarkMicroTs(Vm.Log[] memory logs) internal pure returns (bool found, uint256 micro) {
+        for (uint256 i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == MARK_PUSHED_SIG) {
+                (, , , , micro) = abi.decode(logs[i].data, (uint256, int256, uint16, bool, uint256));
+                found = true;
+            }
+        }
+    }
+
+    function test_markPushEmitsSystemContractTimestamp() public {
+        // Etch the mock at the canonical system-contract address; slot 0 holds the µs value.
+        vm.etch(HP_TIMESTAMP, address(new MockHighPrecisionTimestamp()).code);
+        uint256 micros = 1_720_000_000_123_456;
+        vm.store(HP_TIMESTAMP, bytes32(uint256(0)), bytes32(micros));
+
+        _adv(1);
+        vm.recordLogs();
+        vm.prank(maker);
+        h.setMark(token, 51_000e18);
+
+        (bool found, uint256 micro) = _lastMarkMicroTs(vm.getRecordedLogs());
+        assertTrue(found, "MarkPushed emitted");
+        assertEq(micro, micros, "system-contract micro timestamp carried in event");
+    }
+
+    function test_markPushTimestampFallsBackWithoutSystemContract() public {
+        // No code at the system-contract address -> fall back to block.timestamp * 1e6.
+        _adv(1);
+        vm.recordLogs();
+        vm.prank(maker);
+        h.setMark(token, 51_000e18);
+
+        (bool found, uint256 micro) = _lastMarkMicroTs(vm.getRecordedLogs());
+        assertTrue(found, "MarkPushed emitted");
+        assertEq(micro, uint256(block.timestamp) * 1_000_000, "fallback micro timestamp");
     }
 
     // ============================================================

@@ -13,6 +13,7 @@ import { ECDSA }             from "@openzeppelin/contracts/utils/cryptography/EC
 import { IHitOneMarket }     from "./IHitOneMarket.sol";
 import { ParamCatalog }      from "../common/ParamCatalog.sol";
 import { IAggregatorV3 }     from "../common/IAggregatorV3.sol";
+import { IHighPrecisionTimestamp } from "../common/IHighPrecisionTimestamp.sol";
 import { MarkRing }          from "../common/MarkRing.sol";
 import { FundingIndex }      from "../common/FundingIndex.sol";
 
@@ -26,6 +27,9 @@ contract HitOneMarket is IHitOneMarket, Ownable, Pausable, ReentrancyGuard, EIP7
 
     uint256 internal constant MAX_FUNDING_RATE_ABS          = 1e15;
     uint256 internal constant DEFAULT_MAX_POSITION_NOTIONAL = 200_000e18;
+
+    /// @dev MegaETH high-precision-timestamp system contract (µs since epoch, slot 0).
+    address internal constant HP_TIMESTAMP = 0x6342000000000000000000000000000000000002;
 
     uint256 internal constant UNITS_CAP = 1 << 96;
 
@@ -275,13 +279,14 @@ contract HitOneMarket is IHitOneMarket, Ownable, Pausable, ReentrancyGuard, EIP7
         uint128 newMarkUnits = _toPriceUnits(newMark_1e18, cfg.structural.priceTick);
 
         _checkOracleBand(token, newMark_1e18, cfg.risk.maxDevBps);
+        uint256 microTs = _microTimestamp();
 
         MarkState storage st = _markState[token];
         if (st.lastPushAt == 0) {
             st.currentMark = newMarkUnits;
             st.lastPushAt  = uint64(block.timestamp);
             st.currentRate = nextRate;
-            emit MarkPushed(token, newMark_1e18, 0, 0, false);
+            emit MarkPushed(token, newMark_1e18, 0, 0, false, microTs);
             if (isRateChange) emit FundingRateChanged(token, 0, nextRate, uint64(block.timestamp));
             return;
         }
@@ -304,10 +309,10 @@ contract HitOneMarket is IHitOneMarket, Ownable, Pausable, ReentrancyGuard, EIP7
         uint32 markEntry;
         if (sentinel) {
             markEntry = MarkRing.sentinelEntry();
-            emit MarkPushed(token, newMark_1e18, priceDelta, 0, true);
+            emit MarkPushed(token, newMark_1e18, priceDelta, 0, true, microTs);
         } else {
             markEntry = MarkRing.packEntry(priceDelta, elapsedUnits);
-            emit MarkPushed(token, newMark_1e18, priceDelta, uint16(elapsedUnits), false);
+            emit MarkPushed(token, newMark_1e18, priceDelta, uint16(elapsedUnits), false, microTs);
         }
         MarkRing.writeMarkEntry(_markRing[token], head, markEntry);
         MarkRing.writeRateEntry(_rateRing[token], head, oldRate);
@@ -320,6 +325,17 @@ contract HitOneMarket is IHitOneMarket, Ownable, Pausable, ReentrancyGuard, EIP7
             st.currentRate = nextRate;
             emit FundingRateChanged(token, oldRate, nextRate, uint64(block.timestamp));
         }
+    }
+
+    /// @dev Microsecond wall-clock from MegaETH's system contract, for off-chain validation of
+    /// mark timing. Falls back to `block.timestamp × 1e6` if the system contract is absent (e.g.
+    /// non-MegaETH chains or tests) so a mark push never bricks on the read.
+    function _microTimestamp() internal view returns (uint256) {
+        (bool ok, bytes memory ret) = HP_TIMESTAMP.staticcall(
+            abi.encodeWithSelector(IHighPrecisionTimestamp.timestamp.selector)
+        );
+        if (ok && ret.length >= 32) return abi.decode(ret, (uint256));
+        return uint256(block.timestamp) * 1_000_000;
     }
 
     function _checkOracleBand(address token, uint256 newMark_1e18, uint256 maxDevBps) internal view {
@@ -737,9 +753,12 @@ contract HitOneMarket is IHitOneMarket, Ownable, Pausable, ReentrancyGuard, EIP7
 
     // ---- Liquidate ----
 
-    function liquidate(address token, uint256[] calldata positionIds)
+    function liquidate(address token, uint256 newMark, uint256[] calldata positionIds)
         external override onlyMaker nonReentrant whenNotPaused
     {
+        if (newMark != 0) {
+            _pushMark(token, newMark, _markState[token].currentRate, false);
+        }
         uint256 wipedCount = 0;
         for (uint256 i = 0; i < positionIds.length; i++) {
             uint256 id = positionIds[i];
