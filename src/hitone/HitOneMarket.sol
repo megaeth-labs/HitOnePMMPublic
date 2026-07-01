@@ -94,10 +94,11 @@ contract HitOneMarket is IHitOneMarket, Ownable, Pausable, ReentrancyGuard, EIP7
 
     struct MarkState {
         uint128 currentMark;
-        uint64  lastPushAt;
+        uint64  lastPushAt;   // seconds (block.timestamp) — funding clock
         uint64  ringHead;
         int128  fundingIndex;
         int64   currentRate;
+        uint64  lastPushMs;   // milliseconds (HP wall-clock) — ring/liveness clock
     }
     mapping(address => MarkState) internal _markState;
     mapping(address => uint256[25]) internal _markRing;
@@ -280,19 +281,22 @@ contract HitOneMarket is IHitOneMarket, Ownable, Pausable, ReentrancyGuard, EIP7
 
         _checkOracleBand(token, newMark_1e18, cfg.risk.maxDevBps);
         uint256 microTs = _microTimestamp();
+        uint64 nowMs = uint64(microTs / 1000);
 
         MarkState storage st = _markState[token];
         if (st.lastPushAt == 0) {
             st.currentMark = newMarkUnits;
             st.lastPushAt  = uint64(block.timestamp);
+            st.lastPushMs  = nowMs;
             st.currentRate = nextRate;
             emit MarkPushed(token, newMark_1e18, 0, 0, false, microTs);
             if (isRateChange) emit FundingRateChanged(token, 0, nextRate, uint64(block.timestamp));
             return;
         }
 
-        uint64 elapsed = uint64(block.timestamp) - st.lastPushAt;
-        if (elapsed == 0) revert MarkSameSlot();
+        // Liveness + ring gap run on the HP millisecond clock; funding stays second-based.
+        uint64 elapsedMs = nowMs - st.lastPushMs;
+        if (elapsedMs == 0) revert MarkSameSlot();
 
         int64 oldRate = st.currentRate;
         st.fundingIndex = FundingIndex.effectiveAt(st.fundingIndex, oldRate, st.lastPushAt, uint64(block.timestamp));
@@ -303,7 +307,7 @@ contract HitOneMarket is IHitOneMarket, Ownable, Pausable, ReentrancyGuard, EIP7
         }
 
         uint64 head = st.ringHead;
-        uint256 elapsedUnits = uint256(elapsed) * 1000 / MarkRing.GAP_UNIT_MS;
+        uint256 elapsedUnits = uint256(elapsedMs) / MarkRing.GAP_UNIT_MS;
         bool sentinel = elapsedUnits > MarkRing.GAP_MAX_UNITS;
 
         uint32 markEntry;
@@ -320,6 +324,7 @@ contract HitOneMarket is IHitOneMarket, Ownable, Pausable, ReentrancyGuard, EIP7
         st.ringHead    = head + 1;
         st.currentMark = newMarkUnits;
         st.lastPushAt  = uint64(block.timestamp);
+        st.lastPushMs  = nowMs;
 
         if (isRateChange) {
             st.currentRate = nextRate;

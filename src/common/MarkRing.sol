@@ -5,10 +5,10 @@ pragma solidity ^0.8.27;
 /// @notice Packed ring-buffer encodings for IsoMarket — both the mark-price history (32-bit
 /// packed entries, 8/slot) and the parallel funding-rate ring (int64 entries, 4/slot).
 ///
-/// Mark ring: each slot is 32 bits — int24 priceDelta (tick units, high 24) + uint8 timeDelta
-/// (10ms units, low 8). `timeDelta == 0` is the SENTINEL — written by `setMark` after a
-/// >2.55s gap to signal a ring discontinuity. Walk-back consumers must stop at a sentinel.
-/// A same-10ms-window push is forbidden by the contract (caller must coalesce).
+/// Mark ring: each slot is 32 bits — int20 priceDelta (tick units, high 20) + uint12 timeDelta
+/// (1ms units, low 12). `timeDelta == 0` is the SENTINEL — written by `setMark` after a
+/// >4.095s gap to signal a ring discontinuity. Walk-back consumers must stop at a sentinel.
+/// A same-1ms-window push is forbidden by the contract (caller must coalesce).
 ///
 /// Rate ring: parallel, same RING_LEN, packed as 4 × int64 per uint256 slot. Each slot
 /// records the funding rate active during the interval *ending* at the matching mark entry's
@@ -24,19 +24,19 @@ library MarkRing {
     uint256 internal constant RATE_SLOT_COUNT       = 50;     // RING_LEN / 4
     uint256 internal constant RATE_ENTRIES_PER_SLOT = 4;
     uint256 internal constant RATE_ENTRY_BITS       = 64;
-    uint256 internal constant GAP_UNIT_MS           = 10;
-    uint256 internal constant GAP_MAX_UNITS         = 255;    // 2.55 seconds — beyond this, sentinel
-    int256  internal constant PRICE_DELTA_MIN       = -8_388_608;   // -2^23
-    int256  internal constant PRICE_DELTA_MAX       =  8_388_607;   //  2^23 - 1
+    uint256 internal constant GAP_UNIT_MS           = 1;
+    uint256 internal constant GAP_MAX_UNITS         = 4095;   // 4.095 seconds — beyond this, sentinel
+    int256  internal constant PRICE_DELTA_MIN       = -524_288;     // -2^19
+    int256  internal constant PRICE_DELTA_MAX       =  524_287;     //  2^19 - 1
     uint8   internal constant TIME_DELTA_SENTINEL   = 0;
 
-    /// @notice Pack a non-sentinel (priceDelta, timeDelta) entry. timeDelta must be in [1, 255].
-    /// Reverts if priceDelta does not fit in int24.
+    /// @notice Pack a non-sentinel (priceDelta, timeDelta) entry. timeDelta must be in [1, 4095].
+    /// Reverts if priceDelta does not fit in int20.
     function packEntry(int256 priceDelta, uint256 timeDelta) internal pure returns (uint32) {
         if (priceDelta < PRICE_DELTA_MIN || priceDelta > PRICE_DELTA_MAX) revert MarkDeltaTooLarge();
-        uint32 timeBits  = uint32(timeDelta) & 0xFF;
-        uint32 priceBits = uint32(uint256(priceDelta) & 0xFFFFFF);
-        return (priceBits << 8) | timeBits;
+        uint32 timeBits  = uint32(timeDelta) & 0xFFF;
+        uint32 priceBits = uint32(uint256(priceDelta) & 0xFFFFF);
+        return (priceBits << 12) | timeBits;
     }
 
     /// @notice Sentinel entry: timeDelta = 0, priceDelta = 0. Marks a gap > 2.55s in the ring.
@@ -46,16 +46,16 @@ library MarkRing {
     }
 
     function isSentinel(uint32 entry) internal pure returns (bool) {
-        return (entry & 0xFF) == 0;
+        return (entry & 0xFFF) == 0;
     }
 
     /// @notice Unpack a non-sentinel entry. Callers must check `isSentinel` first.
     function unpackEntry(uint32 entry) internal pure returns (int256 priceDelta, uint256 timeDelta) {
-        timeDelta = entry & 0xFF;
-        uint32 priceBits = entry >> 8;
-        // Sign-extend the 24-bit two's-complement value.
-        if (priceBits & 0x800000 != 0) {
-            priceDelta = int256(uint256(priceBits)) - (1 << 24);
+        timeDelta = entry & 0xFFF;
+        uint32 priceBits = entry >> 12;
+        // Sign-extend the 20-bit two's-complement value.
+        if (priceBits & 0x80000 != 0) {
+            priceDelta = int256(uint256(priceBits)) - (1 << 20);
         } else {
             priceDelta = int256(uint256(priceBits));
         }

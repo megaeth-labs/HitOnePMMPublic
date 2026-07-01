@@ -488,6 +488,28 @@ contract HitOneMarketTest is Test {
         assertEq(micro, uint256(block.timestamp) * 1_000_000, "fallback micro timestamp");
     }
 
+    function test_markPushSubSecondAllowedOnHpClock() public {
+        // Liveness runs on the HP millisecond clock, so two marks can land in the same
+        // block.timestamp second as long as the HP wall-clock advanced by >= 1ms.
+        vm.etch(HP_TIMESTAMP, address(new MockHighPrecisionTimestamp()).code);
+        _adv(1);
+        uint256 base = uint256(block.timestamp) * 1_000_000;
+        vm.store(HP_TIMESTAMP, bytes32(uint256(0)), bytes32(base));
+        vm.prank(maker);
+        h.setMark(token, 50_100e18);
+
+        // Same second, +200ms on the HP clock → distinct slot, accepted.
+        vm.store(HP_TIMESTAMP, bytes32(uint256(0)), bytes32(base + 200_000));
+        vm.prank(maker);
+        h.setMark(token, 50_200e18);
+        assertEq(h.marketOf(token).mark, 50_200e18, "sub-second mark accepted");
+
+        // Same HP millisecond → rejected as a same-slot push.
+        vm.prank(maker);
+        vm.expectRevert(IHitOneMarket.MarkSameSlot.selector);
+        h.setMark(token, 50_300e18);
+    }
+
     // ============================================================
     // Expire
     // ============================================================

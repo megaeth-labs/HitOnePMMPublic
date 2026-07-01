@@ -57,7 +57,7 @@ interface IHitOneMarket {
         address indexed token,
         uint256 newMark,
         int256  priceDelta,
-        uint16  timeDelta10ms,
+        uint16  timeDeltaMs,
         bool    isSentinel,
         uint256 microTimestamp
     );
