@@ -170,8 +170,6 @@ interface IHitOneMarket {
     /// side/leverage/size that doesn't match the active position.
     error BadUserSig();
 
-    error FundingRateOutOfBounds();
-
     error PositionNotionalCap();
     error OIGrossCap();
     error OISkewCap();
@@ -218,7 +216,7 @@ interface IHitOneMarket {
     struct MarketView {
         uint256 mark;               // 1e18 USDM-wei
         int128  fundingIndex;
-        int64   currentRate;
+        int64   currentRatePct;     // signed fixed-point funding rate, ±1%/sec across int64
         uint64  ringHead;
         uint256 openInterestLong;   // USDM-wei notional
         uint256 openInterestShort;  // USDM-wei notional
@@ -311,6 +309,15 @@ interface IHitOneMarket {
     // ============================================================
 
     function setMark(address token, uint256 newMark) external;
+
+    /// @notice Push a new mark and funding rate for `token`.
+    /// @param newRate Funding rate as a signed fixed-point FRACTION per second:
+    ///   real_fraction_per_sec = newRate / (100 * 2**63). The full int64 range spans ±1%/sec, so the
+    ///   rate is inherently hard-capped at 1%/sec — there is no larger representable value.
+    ///   E.g. 0.01%/hour ≈ (1e-4 / 3600) * 100 * 2**63 ≈ 2.56e13. Positive → longs pay shorts;
+    ///   negative → shorts pay longs. The absolute USDM funding is derived at accrual time as
+    ///   `fraction * mark`, so the effective rate tracks the mark automatically — the maker does
+    ///   NOT rescale it when the price moves (unlike a raw price-denominated rate).
     function setMarkAndRate(address token, uint256 newMark, int64 newRate) external;
 
     // ============================================================

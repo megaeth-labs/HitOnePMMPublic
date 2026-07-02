@@ -159,11 +159,19 @@ contract HitOneMarketTest is Test {
     // Constructor + roles
     // ============================================================
 
-    function test_constructorRejectsZero() public {
+    function test_constructorRejectsZeroUsdm() public {
         vm.expectRevert(IHitOneMarket.ZeroAddress.selector);
         new HitOneMarket(owner, maker, address(0));
-        vm.expectRevert(IHitOneMarket.ZeroAddress.selector);
-        new HitOneMarket(owner, address(0), address(usdm));
+    }
+
+    function test_constructorAllowsZeroMaker() public {
+        // Deploying without a maker is allowed: the venue is inert until the owner
+        // appoints one via setMaker. No MakerSet(address(0)) is emitted.
+        HitOneMarket m = new HitOneMarket(owner, address(0), address(usdm));
+        assertFalse(m.isMaker(address(0)));
+        vm.prank(owner);
+        m.setMaker(maker, true);
+        assertTrue(m.isMaker(maker));
     }
 
     function test_constructorSetsRoles() public view {
@@ -577,6 +585,33 @@ contract HitOneMarketTest is Test {
         uint256 makerPoolAfter = h.collateral(MAKER_POOL, token);
         assertEq((userAfter - userBefore) + (makerPoolAfter - makerPoolBefore), 500e18,
             "H-1: funding leaked from maker pool on close");
+    }
+
+    /// @notice The funding rate is a FRACTION of the mark, not an absolute amount: funding paid =
+    /// rate/(100*2**63) * mark * dt * size. This pins the magnitude so a regression to a model that
+    /// ignores the mark factor fails loudly.
+    function test_fundingRateIsPercentageOfMark() public {
+        _adv(1);
+        vm.prank(maker);
+        h.setMarkAndRate(token, 50_000e18, 1e13); // ≈ 1.08e-8/sec fraction (~0.0039%/hour)
+
+        _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
+
+        uint256 makerPoolBefore = h.collateral(MAKER_POOL, token);
+
+        _adv(uint64(1 hours));
+        IHitOneMarket.Order memory o = _closeOrder(alice, true, 1e18, 50_000e18, 100, 1);
+        bytes memory sig = _sign(alicePk, o);
+        vm.prank(maker);
+        h.closePosition(o, 50_000e18, sig);
+
+        // 1 BTC long, flat mark, so PnL = 0 and the long's funding flows entirely to the pool.
+        uint256 expected = uint256(1e13) * 50_000e18 * uint256(1 hours) / (uint256(100) << 63);
+        assertApproxEqAbs(h.collateral(MAKER_POOL, token) - makerPoolBefore, expected, 1e16,
+            "funding must equal rate x mark x dt (not rate x dt)");
+        // Sanity: the mark factor makes this ~1.95 USDM; without it (rate x dt) it'd be ~3.9e-5.
+        assertGt(expected, 1.9e18);
+        assertLt(expected, 2e18);
     }
 
     // ============================================================
