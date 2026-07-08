@@ -239,6 +239,33 @@ Setting `structural.priceTick == 0` in `setToken` **deregisters** the token.
 - `maxPositionDuration` — `[1 h, 365 d]`; expiry clock.
 - `cutIntercept` / `cutSlopeBps` / `maxCutBps` — winnings-cut ramp (`maxCutBps <= 5000`).
 
+**Reference starting point (illustrative, not enforced).** These are *not* defaults the
+contract fills in — `Structural` has no defaults, every field is required. This is a sane
+BTC-like set to copy and then tune per token:
+
+```solidity
+ParamCatalog.Structural({
+    priceTick:           1e18,      // $1 price step. Scale to the asset's price: a $2 token
+                                    //   wants a much smaller tick (e.g. 1e15 = $0.001).
+    sizeTick:            1e10,      // 1e-8 asset min size increment (~1 sat for an 18-dec asset).
+    notionalScale:       0,         // leave 0 — derived = priceTick * sizeTick / usdmDenom.
+    minLeverage:         500,       // 500x floor — this venue is built for high leverage.
+    maxLeverage:         1000,      // 1000x ceiling.
+    maxPositionDuration: 30 days,   // expiry clock; anyone can expirePosition past this.
+    cutIntercept:        100e18,    // first $100 of profit is rake-free.
+    cutSlopeBps:         1,         // +1 bp of cut rate per $1 of profit above the intercept …
+    maxCutBps:           550        // … capped at 5.5%. (So the cap bites at ~$650 profit.)
+})
+```
+
+Tuning notes:
+- **priceTick × sizeTick must be divisible by `usdmDenom`** (10**usdm.decimals()) or `setToken`
+  reverts `BadPriceTick`; the product also sets notional granularity, so don't make both huge.
+- **Winnings cut**: for a flat rate instead of a ramp, set `cutIntercept = 0` and a large
+  `cutSlopeBps` so `maxCutBps` is hit immediately. For no house cut at all, set all three to 0.
+- **maxLeverage** is the main knob on how much adverse-move risk the maker pool absorbs per unit
+  of collateral — treat it as a risk-budget decision, not a UX one.
+
 `Risk` (maker, frequent; zero → sensible default):
 - `openFeeBps` (`<= 1000`), `maxPositionNotional` (0 → 200 000e18),
   `maxOIGross` / `maxOISkew` (0 → unlimited), `maxDevBps` (0 → 3; oracle band).
