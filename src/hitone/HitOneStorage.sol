@@ -5,7 +5,6 @@ import { IERC20 }            from "@openzeppelin/contracts/token/ERC20/IERC20.so
 import { IERC20Metadata }    from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import { SafeERC20 }         from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Ownable }           from "@openzeppelin/contracts/access/Ownable.sol";
-import { Pausable }          from "@openzeppelin/contracts/utils/Pausable.sol";
 import { ReentrancyGuard }   from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import { EIP712 }            from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 
@@ -15,11 +14,14 @@ import { ParamCatalog }      from "../common/ParamCatalog.sol";
 /// @title HitOneStorage
 /// @notice Shared storage layout, constants, immutables, modifiers and tick helpers for
 /// HitOneMarket. All state lives here so the layout is unambiguous across the inheritance tree.
-abstract contract HitOneStorage is IHitOneMarket, Ownable, Pausable, ReentrancyGuard, EIP712 {
+abstract contract HitOneStorage is IHitOneMarket, Ownable, ReentrancyGuard, EIP712 {
     using SafeERC20 for IERC20;
 
     address public constant override MAKER_POOL                = address(0);
     uint256 public constant override MAKER_POOL_WITHDRAW_DELAY = 48 hours;
+
+    /// @dev Minimum time a halt must stay live before `unhalt` is permitted.
+    uint256 public constant override HALT_COOLDOWN = 20 minutes;
 
     uint256 internal constant DEFAULT_MAX_POSITION_NOTIONAL = 200_000e18;
 
@@ -35,8 +37,11 @@ abstract contract HitOneStorage is IHitOneMarket, Ownable, Pausable, ReentrancyG
 
     IERC20 public immutable override usdm;
     uint256 internal immutable _usdmDenom;
-    address public override pauser;
+    address public override funder;
+    address public override halter;
     bool    public override pausedNew;
+    bool    public override halted;
+    uint64  public override haltedUntil;   // earliest timestamp `unhalt` may succeed
 
     mapping(address => bool) public override isMaker;
 
@@ -109,9 +114,10 @@ abstract contract HitOneStorage is IHitOneMarket, Ownable, Pausable, ReentrancyG
     mapping(uint256 => PendingWithdrawal) internal _pendingWithdrawals;
     uint256 internal _nextWithdrawalId;
 
-    modifier onlyMaker()         { if (!isMaker[msg.sender])     revert NotMaker();     _; }
-    modifier onlyOwnerOrPauser() {
-        if (msg.sender != owner() && msg.sender != pauser) revert NotOwnerOrPauser();
+    modifier onlyMaker()  { if (!isMaker[msg.sender]) revert NotMaker();  _; }
+    modifier onlyFunder() { if (msg.sender != funder) revert NotFunder(); _; }
+    modifier whenNotHalted() {
+        if (halted) revert MarketHalted();
         _;
     }
     modifier whenNotPausedNew() {

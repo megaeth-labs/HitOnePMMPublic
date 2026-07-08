@@ -23,7 +23,7 @@ end-to-end in one file. Storage lives in exactly one place.
 | `HitOneOrders.sol`    | EIP-712 order digest, signature/nonce verification, slippage-band check. |
 | `HitOneMarks.sol`     | Mark + funding-rate push logic, oracle-band check, HP-timestamp read, mark-domain views (`marketOf`, `reconstructAt`). |
 | `HitOnePositions.sol` | Position lifecycle: open, increase, close/decrease, expire, settle, liquidate, position views. |
-| `HitOneAdmin.sol`     | Owner/maker/pauser admin, token/oracle config, maker-pool funding + timelocked withdrawals. |
+| `HitOneAdmin.sol`     | Owner/maker/funder/halter admin, halt/unhalt, token/oracle config, maker-pool funding + timelocked withdrawals. |
 | `HitOneMarket.sol`    | Concrete contract; just the constructor + inheritance (`HitOnePositions`, `HitOneAdmin`). |
 | `IHitOneMarket.sol`   | Full external interface: events, errors, structs, function signatures. **Start here when integrating.** |
 
@@ -47,17 +47,23 @@ absolute ones.
 
 | Role | Set by | Powers |
 |---|---|---|
-| **owner** | constructor / `transferOwnership` | `setToken`, `setOracle`, `setMaker`, `setPauser`, `unpause`, `cancelWithdrawMakerPool`. Overall admin. |
-| **maker** | `setMaker` (owner) | Submit user orders (`openPosition`/`increasePosition`/`closePosition`), push marks (`setMark`/`setMarkAndRate`), `liquidate`, `setRiskLimits`, fund/queue maker-pool withdrawals. Multiple makers allowed. Self-revoke via `renounceMaker`. |
-| **pauser** | `setPauser` (owner) | `pause` (emergency stop) and `setPausedNew`. Cannot `unpause`. |
+| **owner** | constructor / `transferOwnership` | `setToken`, `setOracle`, `setMaker`, `setFunder`, `setHalter`, `unhalt`, `cancelWithdrawMakerPool`. Overall admin. |
+| **maker** | `setMaker` (owner) | Submit user orders (`openPosition`/`increasePosition`/`closePosition`), push marks (`setMark`/`setMarkAndRate`), `liquidate`, `setRiskLimits`. Multiple makers allowed. Self-revoke via `renounceMaker`. |
+| **funder** | `setFunder` (owner) | Fund and queue maker-pool withdrawals (`fundMakerPool` / `queueWithdrawMakerPool`). Single address. |
+| **halter** | `setHalter` (owner) | `halt`, `unhalt` (after cooldown), `setPausedNew`. Single address. |
 
 Permissionless entry points: `expirePosition` (after max duration) and
 `executeWithdrawMakerPool` (after the timelock).
 
-Pause semantics:
-- `pause()` (owner or pauser) → `whenNotPaused` blocks opens, increases, closes, marks,
-  liquidation. Only `unpause()` (owner) lifts it.
-- `setPausedNew(true)` (owner, pauser, or maker) → `whenNotPausedNew` blocks **new opens and
+Halt semantics:
+- `halt()` (any **maker**, the **funder**, the **halter**, or **owner**) → sets `halted` and
+  `whenNotHalted` blocks opens, increases, closes, marks, liquidation. It also stamps
+  `haltedUntil = now + HALT_COOLDOWN` (**20 min**); calling again while halted pushes the
+  window further out (halters can keep a halt live indefinitely).
+- `unhalt()` (**owner** or **halter** only) → lifts the halt, but reverts `HaltCooldownActive`
+  until `block.timestamp >= haltedUntil`. Unhalting is always an explicit transaction — the
+  halt never expires on its own.
+- `setPausedNew(true)` (owner, halter, or maker) → `whenNotPausedNew` blocks **new opens and
   increases only**; closes/decreases and liquidation stay live so users can always exit.
 
 ---
@@ -109,7 +115,7 @@ close/decrease/expire. Only the **maker pool** (`MAKER_POOL == address(0)`) keep
 - The house "winnings cut" (see §7) is credited back to the maker pool on profitable closes.
 
 Maker-pool treasury operations:
-- `fundMakerPool(token, amount)` — maker deposits USDM.
+- `fundMakerPool(token, amount)` — funder deposits USDM.
 - `queueWithdrawMakerPool(token, amount, to)` → returns `id`; then
   `executeWithdrawMakerPool(id)` after `MAKER_POOL_WITHDRAW_DELAY` (**48 h**). `owner` can
   `cancelWithdrawMakerPool(id)` during the delay. Execution is permissionless once ready.

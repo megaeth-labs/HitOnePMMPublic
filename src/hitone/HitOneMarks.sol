@@ -13,13 +13,13 @@ import { FundingIndex }      from "../common/FundingIndex.sol";
 abstract contract HitOneMarks is HitOneStorage {
     // ---- Mark + funding (admin) ----
 
-    function setMark(address token, uint256 newMark) external override onlyMaker whenNotPaused {
+    function setMark(address token, uint256 newMark) external override onlyMaker whenNotHalted {
         _pushMark(token, newMark, _markState[token].currentRatePct, false);
     }
     // newRate is a signed fixed-point funding FRACTION per second (real = newRate / (100 * 2**63)),
     // NOT a price-scaled amount. The int64 range inherently caps it at ±1%/sec, so no explicit
     // bound check is needed. See IHitOneMarket.setMarkAndRate for the full semantics.
-    function setMarkAndRate(address token, uint256 newMark, int64 newRate) external override onlyMaker whenNotPaused {
+    function setMarkAndRate(address token, uint256 newMark, int64 newRate) external override onlyMaker whenNotHalted {
         _pushMark(token, newMark, newRate, true);
     }
 

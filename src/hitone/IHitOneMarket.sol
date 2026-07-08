@@ -17,16 +17,17 @@ import { ParamCatalog }  from "../common/ParamCatalog.sol";
 ///
 /// Roles:
 ///   - owner   — overall admin
-///   - maker   — submits user-signed orders on-chain; supplies + withdraws maker-pool collateral
+///   - maker   — submits user-signed orders on-chain, pushes marks/rates, liquidates
 ///               (multiple makers allowed)
-///   - pauser  — emergency pause
+///   - funder  — supplies + withdraws maker-pool collateral
+///   - halter  — emergency halt/unhalt (see `halt`)
 ///
 /// No taker role. The maker is the sole on-chain submitter for opens and closes.
 ///
 /// **Collateral model.** Users hold no internal balance. They grant USDM allowance to this
 /// contract; on open/increase the required collateral is pulled from the user's wallet, and
 /// on close/decrease the payout is sent back to the user's wallet. Only the maker pool keeps
-/// an internal balance, funded by the maker via `fundMakerPool` and withdrawn through the
+/// an internal balance, funded by the funder via `fundMakerPool` and withdrawn through the
 /// timelocked queue.
 ///
 /// Positions are id-indexed and retained after close. At most one active position per
@@ -37,7 +38,13 @@ interface IHitOneMarket {
     // ============================================================
 
     event MakerSet(address indexed maker, bool allowed);
-    event PauserSet(address indexed pauser);
+    event FunderSet(address indexed funder);
+    event HalterSet(address indexed halter);
+
+    /// @notice Emitted when the market is halted or the halt window is extended. `haltedUntil`
+    /// is the earliest timestamp at which `unhalt` may succeed.
+    event Halted(address indexed by, uint64 haltedUntil);
+    event Unhalted(address indexed by);
 
     event TokenSet(address indexed token, ParamCatalog.Structural structural);
     event RiskLimitsSet(address indexed token, ParamCatalog.Risk risk);
@@ -136,7 +143,13 @@ interface IHitOneMarket {
     // ============================================================
 
     error NotMaker();
-    error NotOwnerOrPauser();
+    error NotFunder();
+    error NotHalter();
+    error NotHaltAuth();
+    error NotPausedNewAuth();
+    error MarketHalted();
+    error NotHalted();
+    error HaltCooldownActive();
     error ZeroAddress();
 
     error BadLeverage();
@@ -185,6 +198,7 @@ interface IHitOneMarket {
 
     function MAKER_POOL()                external view returns (address);
     function MAKER_POOL_WITHDRAW_DELAY() external view returns (uint256);
+    function HALT_COOLDOWN()             external view returns (uint256);
 
     // ============================================================
     // EIP-712 order signed by the user
@@ -252,8 +266,11 @@ interface IHitOneMarket {
     // ============================================================
 
     function usdm() external view returns (IERC20);
-    function pauser() external view returns (address);
+    function funder() external view returns (address);
+    function halter() external view returns (address);
     function pausedNew() external view returns (bool);
+    function halted() external view returns (bool);
+    function haltedUntil() external view returns (uint64);
 
     function isMaker(address account) external view returns (bool);
 
@@ -280,22 +297,27 @@ interface IHitOneMarket {
     // ============================================================
 
     function setMaker(address m, bool allowed) external;
-    function setPauser(address p) external;
+    function setFunder(address f) external;
+    function setHalter(address h) external;
     function renounceMaker() external;
 
     function setToken(address token, ParamCatalog.TokenParams calldata params) external;
     function setRiskLimits(address token, ParamCatalog.Risk calldata risk) external;
     function setOracle(address token, address feed, uint8 decimals, uint32 maxStale) external;
 
-    function pause() external;
-    function unpause() external;
+    /// @notice Emergency halt. Callable by any maker, the funder, the halter, or the owner.
+    /// Freezes opens, increases, closes, liquidations and mark pushes. Sets a fresh
+    /// `HALT_COOLDOWN` window; calling again while halted only pushes `haltedUntil` further out.
+    function halt() external;
+    /// @notice Lift the halt. Owner or halter only, and only once `haltedUntil` has elapsed.
+    function unhalt() external;
     function setPausedNew(bool paused) external;
 
     // ============================================================
     // maker pool
     // ============================================================
 
-    /// @notice Maker supplies maker-pool collateral for `token`, pulling USDM from msg.sender.
+    /// @notice Funder supplies maker-pool collateral for `token`, pulling USDM from msg.sender.
     function fundMakerPool(address token, uint256 amount) external;
 
     function queueWithdrawMakerPool(address token, uint256 amount, address to) external returns (uint256 id);

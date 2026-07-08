@@ -8,7 +8,7 @@ import { HitOneStorage }     from "./HitOneStorage.sol";
 import { ParamCatalog }      from "../common/ParamCatalog.sol";
 
 /// @title HitOneAdmin
-/// @notice Owner/maker/pauser admin surface, maker-pool collateral flows and config views.
+/// @notice Owner/maker/funder/halter admin surface, maker-pool collateral flows and config views.
 abstract contract HitOneAdmin is HitOneStorage {
     using SafeERC20 for IERC20;
 
@@ -22,8 +22,11 @@ abstract contract HitOneAdmin is HitOneStorage {
         if (!isMaker[msg.sender]) revert NotMaker();
         isMaker[msg.sender] = false; emit MakerSet(msg.sender, false);
     }
-    function setPauser(address p) external override onlyOwner {
-        pauser = p; emit PauserSet(p);
+    function setFunder(address f) external override onlyOwner {
+        funder = f; emit FunderSet(f);
+    }
+    function setHalter(address h) external override onlyOwner {
+        halter = h; emit HalterSet(h);
     }
 
     function setToken(address token, ParamCatalog.TokenParams calldata p) external override onlyOwner {
@@ -65,23 +68,38 @@ abstract contract HitOneAdmin is HitOneStorage {
         emit OracleSet(token, feed, decimals_, maxStale);
     }
 
-    function pause()   external override onlyOwnerOrPauser { _pause(); }
-    function unpause() external override onlyOwner         { _unpause(); }
+    /// @notice Emergency halt. Callable by any maker, the funder, the halter, or the owner.
+    /// Sets a fresh `HALT_COOLDOWN` window; re-calling while halted pushes `haltedUntil` out.
+    function halt() external override {
+        if (!isMaker[msg.sender] && msg.sender != funder && msg.sender != halter && msg.sender != owner())
+            revert NotHaltAuth();
+        halted = true;
+        haltedUntil = uint64(block.timestamp + HALT_COOLDOWN);
+        emit Halted(msg.sender, haltedUntil);
+    }
+    /// @notice Lift the halt. Owner or halter only, and only once the cooldown has elapsed.
+    function unhalt() external override {
+        if (msg.sender != owner() && msg.sender != halter) revert NotHalter();
+        if (!halted)                          revert NotHalted();
+        if (block.timestamp < haltedUntil)    revert HaltCooldownActive();
+        halted = false;
+        emit Unhalted(msg.sender);
+    }
     function setPausedNew(bool paused_) external override {
-        if (!isMaker[msg.sender] && msg.sender != pauser && msg.sender != owner()) revert NotOwnerOrPauser();
+        if (!isMaker[msg.sender] && msg.sender != halter && msg.sender != owner()) revert NotPausedNewAuth();
         pausedNew = paused_;
         emit PausedNew(paused_);
     }
 
     // ---- Collateral ----
 
-    function fundMakerPool(address token, uint256 amount) external override onlyMaker nonReentrant {
+    function fundMakerPool(address token, uint256 amount) external override onlyFunder nonReentrant {
         usdm.safeTransferFrom(msg.sender, address(this), amount);
         collateral[MAKER_POOL][token] += amount;
         emit MakerPoolFunded(msg.sender, token, amount);
     }
     function queueWithdrawMakerPool(address token, uint256 amount, address to)
-        external override onlyMaker returns (uint256 id)
+        external override onlyFunder returns (uint256 id)
     {
         if (to == address(0)) revert ZeroAddress();
         if (amount > collateral[MAKER_POOL][token]) revert Insolvent();

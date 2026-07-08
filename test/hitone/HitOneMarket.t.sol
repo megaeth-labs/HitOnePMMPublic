@@ -4,7 +4,6 @@ pragma solidity ^0.8.27;
 import { Test }          from "forge-std/Test.sol";
 import { Vm }            from "forge-std/Vm.sol";
 import { Ownable }       from "@openzeppelin/contracts/access/Ownable.sol";
-import { Pausable }      from "@openzeppelin/contracts/utils/Pausable.sol";
 
 import { HitOneMarket }  from "../../src/hitone/HitOneMarket.sol";
 import { IHitOneMarket } from "../../src/hitone/IHitOneMarket.sol";
@@ -19,7 +18,8 @@ contract HitOneMarketTest is Test {
     address internal owner  = address(this);
     address internal maker  = makeAddr("maker");
     address internal maker2 = makeAddr("maker2");
-    address internal pauser = makeAddr("pauser");
+    address internal funder = makeAddr("funder");
+    address internal halter = makeAddr("halter");
 
     // Users sign orders with their keys.
     uint256 internal alicePk = 0xA11CE;
@@ -64,7 +64,8 @@ contract HitOneMarketTest is Test {
 
         usdm = new MockERC20();
         h = new HitOneMarket(owner, maker, address(usdm));
-        h.setPauser(pauser);
+        h.setFunder(funder);
+        h.setHalter(halter);
         h.setToken(makeAddr("btc"), _defaultParams());
         token = makeAddr("btc");
 
@@ -74,15 +75,15 @@ contract HitOneMarketTest is Test {
         // Fund wallets + grant allowance. Collateral is pulled from wallets on open.
         usdm.mint(alice, 1_000_000e18);
         usdm.mint(bob,   1_000_000e18);
-        usdm.mint(maker, 10_000_000e18);
+        usdm.mint(funder, 10_000_000e18);
 
         vm.prank(alice);
         usdm.approve(address(h), type(uint256).max);
         vm.prank(bob);
         usdm.approve(address(h), type(uint256).max);
 
-        // Seed maker pool (maker funds and withdraws it).
-        vm.startPrank(maker);
+        // Seed maker pool (funder funds and withdraws it).
+        vm.startPrank(funder);
         usdm.approve(address(h), type(uint256).max);
         h.fundMakerPool(token, 5_000_000e18);
         vm.stopPrank();
@@ -537,28 +538,62 @@ contract HitOneMarketTest is Test {
     }
 
     // ============================================================
-    // Pause
+    // Halt
     // ============================================================
 
-    function test_pauseBlocksOpenAndClose() public {
+    function test_haltBlocksOpenAndClose() public {
         uint256 id = _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
-        vm.prank(pauser);
-        h.pause();
+        vm.prank(halter);
+        h.halt();
 
         _adv(1);
         IHitOneMarket.Order memory o = _openOrder(bob, true, 1e18, 100, 50_000e18, 100, 0);
         bytes memory sig = _sign(bobPk, o);
         vm.prank(maker);
-        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vm.expectRevert(IHitOneMarket.MarketHalted.selector);
         h.openPosition(o, 50_000e18, sig);
 
         IHitOneMarket.Order memory co = _closeOrder(alice, true, 1e18, 51_000e18, 100, 1);
         bytes memory csig = _sign(alicePk, co);
         vm.prank(maker);
-        vm.expectRevert(Pausable.EnforcedPause.selector);
+        vm.expectRevert(IHitOneMarket.MarketHalted.selector);
         h.closePosition(co, 51_000e18, csig);
 
         id;
+    }
+
+    function test_haltAuthAndCooldown() public {
+        // maker, funder, halter can all halt; a random account cannot.
+        vm.prank(makeAddr("rando"));
+        vm.expectRevert(IHitOneMarket.NotHaltAuth.selector);
+        h.halt();
+
+        vm.prank(funder);
+        h.halt();
+        assertTrue(h.halted());
+        uint64 until = h.haltedUntil();
+        assertEq(until, uint64(block.timestamp + h.HALT_COOLDOWN()));
+
+        // unhalt is owner/halter only, and blocked until the cooldown elapses.
+        vm.prank(maker);
+        vm.expectRevert(IHitOneMarket.NotHalter.selector);
+        h.unhalt();
+
+        vm.prank(halter);
+        vm.expectRevert(IHitOneMarket.HaltCooldownActive.selector);
+        h.unhalt();
+
+        // re-halting mid-window extends the cooldown.
+        _adv(5 minutes);
+        vm.prank(maker);
+        h.halt();
+        assertEq(h.haltedUntil(), uint64(block.timestamp + h.HALT_COOLDOWN()));
+
+        // past the (extended) window, halter can lift it.
+        vm.warp(h.haltedUntil());
+        vm.prank(halter);
+        h.unhalt();
+        assertFalse(h.halted());
     }
 
     // ============================================================

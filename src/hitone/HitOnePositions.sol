@@ -18,7 +18,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     // ---- Open ----
 
     function openPosition(Order calldata order, uint256 fillPrice, bytes calldata userSig)
-        external override onlyMaker nonReentrant whenNotPaused whenNotPausedNew returns (uint256 id)
+        external override onlyMaker nonReentrant whenNotHalted whenNotPausedNew returns (uint256 id)
     {
         if (!order.isOpen) revert BadUserSig();
         _verifyAndConsumeOrder(order, userSig);
@@ -102,7 +102,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     // ---- Increase (size up) ----
 
     function increasePosition(Order calldata order, uint256 fillPrice, bytes calldata userSig)
-        external override onlyMaker nonReentrant whenNotPaused whenNotPausedNew returns (uint256 id)
+        external override onlyMaker nonReentrant whenNotHalted whenNotPausedNew returns (uint256 id)
     {
         if (!order.isOpen) revert BadUserSig();
         _verifyAndConsumeOrder(order, userSig);
@@ -194,7 +194,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     // ---- Close ----
 
     function closePosition(Order calldata order, uint256 fillPrice, bytes calldata userSig)
-        external override onlyMaker nonReentrant whenNotPaused
+        external override onlyMaker nonReentrant whenNotHalted
     {
         if (order.isOpen) revert BadUserSig();
         _verifyAndConsumeOrder(order, userSig);
@@ -387,7 +387,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     // ---- Liquidate ----
 
     function liquidate(address token, uint256 newMark, uint256[] calldata positionIds)
-        external override onlyMaker nonReentrant whenNotPaused
+        external override onlyMaker nonReentrant whenNotHalted
     {
         if (newMark != 0) {
             _pushMark(token, newMark, _markState[token].currentRatePct, false);
