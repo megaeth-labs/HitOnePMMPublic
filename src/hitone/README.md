@@ -1,12 +1,20 @@
 # HitOne venue
 
-HitOne is a permissioned perpetual-futures venue. Users sign orders off-chain; a
-whitelisted **maker** submits them on-chain and is the counterparty to every position via a
-single shared **maker pool**. There is no order book and no taker role — the maker commits a
-fill price at submission time and the contract enforces the user's signed slippage band.
+HitOne is a perpetual-futures venue built around **fully isolated per-`(maker, token)`
+sub-markets**. Users sign orders off-chain naming the exact **maker** they want as counterparty;
+that maker submits the order on-chain and is the sole counterparty via its **own segregated
+pool**. There is no order book and no taker role — the maker commits a fill price at submission
+time and the contract enforces the user's signed slippage band.
 
-This document is written for someone building the **off-chain processes** that operate the
-venue (order intake, mark/funding pushing, liquidation, treasury). It covers the on-chain
+**Maker registration is permissionless.** Any address can run a book on an owner-registered
+token: it sets its own risk limits, funds its own pool, and pushes its own marks + funding rate.
+Everything that defines a market — marks, funding index/rate, risk limits, open interest and the
+collateral pool — is keyed by `(maker, token)`, so a maker (including a malicious one) can only
+ever affect its own book. The owner's role shrinks to curating the token universe (the structural
+tick/leverage/duration/cut grid) and the emergency `halter` set.
+
+This document is written for someone building the **off-chain processes** that operate a maker
+book (order intake, mark/funding pushing, liquidation, treasury). It covers the on-chain
 interface, the units/scaling conventions, the settlement and funding math, and the operational
 gotchas that will bite an operator if ignored.
 
@@ -23,7 +31,7 @@ end-to-end in one file. Storage lives in exactly one place.
 | `HitOneOrders.sol`    | EIP-712 order digest, signature/nonce verification, slippage-band check. |
 | `HitOneMarks.sol`     | Mark + funding-rate push logic, oracle-band check, HP-timestamp read, mark-domain views (`marketOf`, `reconstructAt`). |
 | `HitOnePositions.sol` | Position lifecycle: open, increase, close/decrease, expire, settle, liquidate, position views. |
-| `HitOneAdmin.sol`     | Owner/maker/funder/halter admin, halt/unhalt, token/oracle config, maker-pool funding + timelocked withdrawals. |
+| `HitOneAdmin.sol`     | Owner/maker/funder/halter admin, timelocked role changes, halt/unhalt, token/oracle config, per-maker pool funding + timelocked withdrawals. |
 | `HitOneMarket.sol`    | Concrete contract; just the constructor + inheritance (`HitOnePositions`, `HitOneAdmin`). |
 | `IHitOneMarket.sol`   | Full external interface: events, errors, structs, function signatures. **Start here when integrating.** |
 
@@ -47,24 +55,31 @@ absolute ones.
 
 | Role | Set by | Powers |
 |---|---|---|
-| **owner** | constructor / `transferOwnership` | `setToken`, `setOracle`, `setMaker`, `setFunder`, `setHalter`, `unhalt`, `cancelWithdrawMakerPool`. Overall admin. |
-| **maker** | `setMaker` (owner) | Submit user orders (`openPosition`/`increasePosition`/`closePosition`), push marks (`setMark`/`setMarkAndRate`), `liquidate`, `setRiskLimits`. Multiple makers allowed. Self-revoke via `renounceMaker`. |
-| **funder** | `setFunder` (owner) | Fund and queue maker-pool withdrawals (`fundMakerPool` / `queueWithdrawMakerPool`). Single address. |
-| **halter** | `setHalter` (owner) | `halt`, `unhalt` (after cooldown), `setPausedNew`. Single address. |
+| **owner** | constructor / `transferOwnership` | Curates tokens (`setToken` structural grid, `setOracle`), `setWithdrawDelay`, queue/cancel the `halter` set, `cancelRoleChange`. **Cannot** register makers, touch any maker's pool, halt, or unhalt. |
+| **maker** | **permissionless** — no registration | Any address, on any owner-registered token: `setRiskLimits` (its own), push marks (`setMark`/`setMarkAndRate`), submit orders naming itself (`openPosition`/`increasePosition`/`closePosition`), `liquidate` its own book, `setMakerFunder`. Each maker's marks/funding/risk/OI/pool are keyed `(maker, token)` and fully isolated. |
+| **funder** | `setMakerFunder(maker, …)` — **self-set by the maker** | Per-maker treasury key. Fund / queue-withdraw / cancel-withdraw for **that maker's pool only**. Defaults to the maker itself when unset; once set, only the funder may rotate it (hot-maker / cold-funder split). |
+| **halter** | `queueSetHalter(addr, allowed)` (owner, timelocked) | `halt`, `unhalt` (after cooldown), `setPausedNew`. **Multiple allowed** (`isHalter` set). Only halters may halt/unhalt — makers, funders and the owner cannot unless separately granted the halter role. |
 
-Permissionless entry points: `expirePosition` (after max duration) and
-`executeWithdrawMakerPool` (after the timelock).
+**Role-change timelock.** The **only** owner role change is the halter set: `queueSetHalter` →
+wait `roleChangeDelay()` (= **2 × `withdrawDelay`**, 12 h by default) → `executeRoleChange(id)`
+(permissionless), or `cancelRoleChange(id)` (owner). Makers self-register and self-fund with no
+timelock — isolation makes that safe, since a maker can only ever harm its own book.
+
+Permissionless entry points: `expirePosition` (after max duration),
+`executeWithdrawMakerPool` (after the delay), and `executeRoleChange` (after the delay).
 
 Halt semantics:
-- `halt()` (any **maker**, the **funder**, the **halter**, or **owner**) → sets `halted` and
+- `halt()` (**halters only** — not makers, funders, or the owner) → sets `halted` and
   `whenNotHalted` blocks opens, increases, closes, marks, liquidation. It also stamps
   `haltedUntil = now + HALT_COOLDOWN` (**20 min**); calling again while halted pushes the
   window further out (halters can keep a halt live indefinitely).
-- `unhalt()` (**owner** or **halter** only) → lifts the halt, but reverts `HaltCooldownActive`
+- `unhalt()` (**halters only**) → lifts the halt, but reverts `HaltCooldownActive`
   until `block.timestamp >= haltedUntil`. Unhalting is always an explicit transaction — the
-  halt never expires on its own.
-- `setPausedNew(true)` (owner, halter, or maker) → `whenNotPausedNew` blocks **new opens and
-  increases only**; closes/decreases and liquidation stay live so users can always exit.
+  halt never expires on its own. The owner cannot unilaterally unhalt, so a halt is a genuine
+  brake against an adversarial owner: it can only be lifted by a halter, and the owner can only
+  change the halter set through the timelock.
+- `setPausedNew(true)` (owner or any halter) → `whenNotPausedNew` blocks **new opens and
+  increases only** (venue-wide); closes/decreases and liquidation stay live so users can always exit.
 
 ---
 
@@ -74,9 +89,10 @@ Halt semantics:
    `chainId`, `verifyingContract` = the market address. Struct in `IHitOneMarket.Order`.
 2. **Backend receives** the signed order + signature.
 3. **Maker picks `fillPrice`** (1e18 USDM-wei) and submits via `openPosition` /
-   `increasePosition` / `closePosition`. The maker's key is `msg.sender` and must be
-   whitelisted.
+   `increasePosition` / `closePosition`. `msg.sender` must equal `order.maker` — the exact maker
+   the user chose (else `WrongMaker`). No whitelist: any address can be a maker.
 4. The contract verifies:
+   - `msg.sender == order.maker` (else `WrongMaker`) — flow can't be stolen by another maker;
    - `block.timestamp <= order.deadline` (else `OrderExpired`);
    - `!nonceUsed[user][channel][nonce]` then marks it used (`NonceAlreadyUsed`);
    - `ECDSA.recover(digest) == order.user` (else `BadUserSig`);
@@ -91,10 +107,11 @@ Nonces are namespaced `(user, channel, nonce)` and single-use — `channel` lets
 independent nonce lanes per user (e.g. one per session/device). Emits `NonceUsed`.
 
 Constraints the backend must respect:
-- **At most one active position per `(user, token)`.** Opening a second reverts
-  `PositionExists`; use `increasePosition` to grow, `closePosition` (partial) to shrink.
+- **At most one active position per `(user, maker, token)`.** Opening a second against the same
+  maker reverts `PositionExists`; use `increasePosition` to grow, `closePosition` (partial) to
+  shrink. A user *can* hold separate positions against different makers on the same token.
 - On increase, the order's `isLong` and `leverage` must match the live position (else
-  `BadUserSig`).
+  `BadUserSig`), and `order.maker` must match (the position is keyed by maker).
 - On close, `order.size <= position.size`. Equal size → full close; smaller → partial
   (size-down) settling pro-rata and leaving the remainder open.
 
@@ -104,30 +121,40 @@ Constraints the backend must respect:
 
 Users hold **no internal balance**. They grant a USDM allowance to the market; collateral is
 pulled from their wallet on open/increase and payouts are pushed back to their wallet on
-close/decrease/expire. Only the **maker pool** (`MAKER_POOL == address(0)`) keeps an internal
-`collateral[...]` balance.
+close/decrease/expire. Each **maker keeps its own segregated pool** — `collateral[maker][token]`
+— and is the counterparty to the positions it opens. A position stores its `maker` at open;
+all its PnL, fees, losses, wipes and the winnings cut settle against **that** maker's pool only,
+so one maker (or a rogue maker the owner adds) can never drain another maker's capital.
 
 - On open: `collateral = markNotional / leverage` is pulled from the user. The open fee
-  (`openFeeBps` of notional) is credited to the maker pool; the position stores
-  `collateral − fee`.
-- PnL flows against the maker pool: user profit is paid out of the pool (reverts `Insolvent`
-  if the pool can't cover it), user loss is absorbed into the pool. Keep the pool funded.
-- The house "winnings cut" (see §7) is credited back to the maker pool on profitable closes.
+  (`openFeeBps` of notional) is credited to the submitting maker's pool; the position stores
+  `collateral − fee` and `maker = msg.sender`.
+- `increasePosition` must be submitted by the position's **own** maker (else `WrongMaker`), so
+  added exposure stays backed by the same pool.
+- PnL flows against the position's maker pool: user profit is paid out of it (reverts
+  `Insolvent` if that pool can't cover it), user loss is absorbed into it. Keep each pool funded.
+- The house "winnings cut" (see §7) is credited back to the position's maker pool on profitable
+  closes.
 
-Maker-pool treasury operations:
-- `fundMakerPool(token, amount)` — funder deposits USDM.
-- `queueWithdrawMakerPool(token, amount, to)` → returns `id`; then
-  `executeWithdrawMakerPool(id)` after `MAKER_POOL_WITHDRAW_DELAY` (**48 h**). `owner` can
-  `cancelWithdrawMakerPool(id)` during the delay. Execution is permissionless once ready.
+Per-maker treasury operations (each callable **only by `makerFunder[maker]`**):
+- `fundMakerPool(maker, token, amount)` — the maker's funder deposits USDM.
+- `queueWithdrawMakerPool(maker, token, amount, to)` → returns `id`; then
+  `executeWithdrawMakerPool(id)` after `withdrawDelay` (**default 6 h**, owner-raisable to 48 h).
+  `cancelWithdrawMakerPool(id)` is **funder-gated, not owner** — so an adversarial owner can't
+  trap a maker's queued exit. Execution is permissionless once ready.
 
 ---
 
 ## 5. Marks + funding
 
-The maker pushes marks continuously and funding rates occasionally.
+Each maker pushes marks continuously and funding rates occasionally **to its own
+`(msg.sender, token)` book** — marks, the mark ring, the funding index and the rate are all
+per-maker. One maker's marks never affect another maker's positions (liquidation, funding or
+expiry). Views take a `maker` argument: `marketOf(maker, token)`, `rateRingAt(maker, token, idx)`,
+`reconstructAt(maker, token, entries)`.
 
-- `setMark(token, newMark)` — push a new mark (1e18 USDM-wei), rate unchanged.
-- `setMarkAndRate(token, newMark, newRate)` — push mark and a new funding rate.
+- `setMark(token, newMark)` — push a new mark (1e18 USDM-wei) to your book, rate unchanged.
+- `setMarkAndRate(token, newMark, newRate)` — push mark and a new funding rate to your book.
 
 ### Funding rate encoding (important)
 
@@ -226,10 +253,14 @@ of old and added; the open fee and OI/notional exposure are charged only on the 
 
 ---
 
-## 8. Per-token parameters
+## 8. Parameters: token-level structural (owner) vs per-maker risk
 
-Set via `setToken(token, TokenParams)` (owner) and `setRiskLimits(token, Risk)` (maker).
-Setting `structural.priceTick == 0` in `setToken` **deregisters** the token.
+**Structural** is token-level and owner-set via `setToken(token, Structural)` — one grid per
+token, shared by every maker on it (so units stay coherent for the oracle). `priceTick == 0`
+**deregisters** the token. **Risk** is per-`(maker, token)` and set by the maker itself via
+`setRiskLimits(token, Risk)` — permissionless, and a maker's book is **inert until it sets risk**
+(the un-set default leaves `maxPositionNotional == 0`, which blocks all opens). Read them back
+with `structuralOf(token)` and `makerRiskOf(maker, token)`.
 
 `Structural` (owner, infrequent):
 - `priceTick` — min price step, 1e18 USDM-wei (e.g. `1e18` = $1).
@@ -266,16 +297,39 @@ Tuning notes:
 - **maxLeverage** is the main knob on how much adverse-move risk the maker pool absorbs per unit
   of collateral — treat it as a risk-budget decision, not a UX one.
 
-`Risk` (maker, frequent; zero → sensible default):
+`Risk` (per-`(maker, token)`, maker-set, frequent; zero → sensible default, but note a wholly
+unset risk struct leaves `maxPositionNotional == 0` and blocks opens — set it before quoting):
 - `openFeeBps` (`<= 1000`), `maxPositionNotional` (0 → 200 000e18),
-  `maxOIGross` / `maxOISkew` (0 → unlimited), `maxDevBps` (0 → 3; oracle band).
+  `maxOIGross` / `maxOISkew` (0 → unlimited).
 - `linearScale` / `quadScale` are IsoMarket slippage knobs — **unused by HitOne** (fills come
   from the maker + slippage band), pass `type(uint256).max`.
+- `maxDevBps` in this struct is **unused by HitOne** — the oracle band lives in the owner's oracle
+  config (below), not per-maker, so a maker can't loosen it.
 
-Optional oracle: `setOracle(token, feed, decimals, maxStale)`. When a `feed` is set, every mark
-push checks `|newMark − oraclePrice| * 10000 <= maxDevBps * oraclePrice` and staleness
+### Oracle band (owner-set per token — the context makers operate within)
+
+`setOracle(token, feed, decimals, maxStale, maxDevBps)` (**owner**, optional; `feed == 0`
+disables). It's the one price guardrail the owner defines for a token; every maker's marks on that
+token are checked against the same feed and band, so a maker cannot widen it. On each mark push
+(`setMark`/`setMarkAndRate`, open/close/liquidate) the contract checks
+`|newMark − oraclePrice| * 10000 <= maxDevBps * oraclePrice` and staleness
 (`block.timestamp <= updatedAt + maxStale`), reverting `MarkOutOfOracleBand` / `OracleStale` /
-`OracleBadAnswer`. No feed → checks skipped.
+`OracleBadAnswer`. The intent is a **sanity band, not a precise price** — keep the mark from
+drifting far enough to exploit anyone.
+
+**RedStone on MegaETH** (see `script/hitone/RedStoneFeeds.sol` for per-chain addresses):
+- Feeds are Chainlink `AggregatorV3`-compatible, so `setOracle` reads them directly — no glue.
+- **RedStone runs the relayer** that keeps the price on-chain; HitOne only does a `view` read. You
+  don't run a pusher, and there's no per-tx payload (that's the *pull* model, which HitOne doesn't
+  use).
+- Recommended (first version): **`maxDevBps = 100`** (1%) and **`maxStale = 6 h`** — the standard
+  push feed's heartbeat. `maxStale` is a hard floor that must survive the worst case (a flat window
+  with no 0.1% move); in practice the deviation trigger keeps updates far more frequent, so 6 h is
+  fine. For a tighter *guaranteed* freshness bound later, ask RedStone for a shorter-heartbeat feed
+  or use Bolt (same interface, same read cost). Feeds are USD-denominated (8-dec); to guard against
+  a USDm de-peg, normalize by the `USDm-TWAP-60` feed.
+- **Not yet timelocked.** `setOracle` (and `setToken`) take effect immediately; time-delaying the
+  owner's token-context changes is a planned follow-up.
 
 Risk caps enforced at open/increase: `PositionNotionalCap`, `OIGrossCap`, `OISkewCap`.
 
@@ -302,8 +356,11 @@ Risk caps enforced at open/increase: `PositionNotionalCap`, `OIGrossCap`, `OISke
 
 `MarkPushed`, `FundingRateChanged`, `NonceUsed`, `PositionOpened`, `PositionIncreased`,
 `PositionDecreased`, `PositionClosed`, `PositionLiquidated`, `PositionExpired`, plus admin
-events (`MakerSet`, `TokenSet`, `RiskLimitsSet`, `OracleSet`, maker-pool fund/withdraw,
-`PausedNew`). `PositionClosed` carries the gross `pnl` / `fundingPaid` / `makerCut` split;
+events (`MakerFunderSet`, `HalterSet`, `RoleChangeQueued`/`Executed`/`Cancelled`,
+`WithdrawDelaySet`, `Halted`/`Unhalted`, `TokenSet`, `RiskLimitsSet` (indexed by `maker`),
+`OracleSet`, maker-pool fund/withdraw (carry `maker`), `PausedNew`). `MarkPushed` and
+`FundingRateChanged` are now indexed by `(maker, token)` — filter by maker to follow one book.
+`PositionClosed` carries the gross `pnl` / `fundingPaid` / `makerCut` split;
 `PositionView.realizedPnl` stores only the *effective* PnL, so reconstruct the split from the
 event.
 
@@ -311,26 +368,38 @@ event.
 
 ## 11. Off-chain processes to build (checklist)
 
+0. **Maker onboarding** — a new maker self-registers on a token: `setRiskLimits(token, risk)`,
+   optionally `setMakerFunder(maker, coldKey)`, fund the pool, push a first mark. No owner step.
 1. **Order gateway** — verify user sigs off-chain (fail fast), pick `fillPrice`, submit with the
-   maker key. Handle nonce/channel allocation and deadline windows.
+   maker key named in `order.maker`. Handle nonce/channel allocation and deadline windows.
 2. **Mark + funding pusher** — push marks at a steady cadence (never twice in one ms; keep gaps
    under 4.095 s to preserve liquidation history; split moves > ±524 287 ticks; stay inside the
    oracle band). Update funding rate on demand — no rescaling on price moves.
 3. **Liquidation engine** — track live `effPnl` vs `col`, submit `liquidate` batches (optionally
    with a fresh mark). Remember the 200-entry / sentinel walk-back limit.
 4. **Expiry sweeper** — optional; permissionless `expirePosition` past max duration.
-5. **Treasury** — keep the maker pool solvent (`fundMakerPool`); manage the 48 h timelocked
-   withdrawal queue.
+5. **Treasury** — keep each maker's segregated pool solvent (`fundMakerPool(maker, …)` from that
+   maker's funder key); manage the timelocked withdrawal queue (`withdrawDelay`, 6–48 h).
 6. **Indexer** — consume the events above; validate mark timing against `microTimestamp`.
 
 ---
 
 ## 12. Deployment
 
-Constructor: `HitOneMarket(owner, maker, usdm)` — sets the owner, whitelists an initial maker,
-and caches USDM decimals. EIP-712 domain is fixed to `("HitOneMarket", "1")`.
+Constructor: `HitOneMarket(owner, usdm)` — sets the owner and caches USDM decimals. No initial
+maker (registration is permissionless). EIP-712 domain is fixed to `("HitOneMarket", "1")`.
 
-`script/hitone/DeployHitOne.s.sol` is a reference testnet deploy: it deploys the market, seeds
-USDM + a market token if not supplied, registers the token, temporarily self-grants maker to
-seed the pool and push an initial mark, then revokes and hands ownership to `MM_OWNER`. Env
-vars are documented at the top of that script.
+**Bring-up.** Owner side: deploy → `setToken` for each token → `queueSetHalter` → wait
+`roleChangeDelay()` (12 h at the default 6 h `withdrawDelay`) → `executeRoleChange` → optionally
+`transferOwnership`. Maker side (permissionless, any time after the token is registered):
+`setRiskLimits` → optional `setMakerFunder` → `fundMakerPool` → `setMark`. The only timelocked
+step is installing halters; makers need no owner involvement.
+
+Scripts (`script/hitone/`): `DeployHitOne.s.sol` (owner bring-up + a self-registered maker),
+`SimHitOneTrade.s.sol` (real on-chain open→close round trip — run it twice, it opens then closes),
+and `RedStoneFeeds.sol` (per-chain oracle feed addresses + recommended band values).
+
+**Contract-size note.** `HitOneMarket` runs close to the EIP-170 24 576-byte limit. `foundry.toml`
+strips metadata (`bytecode_hash = "none"`, `cbor_metadata = false`) and `reconstructAt` was dropped
+(reconstruct from the `MarkPushed`/`FundingRateChanged` event stream) to leave margin (~24.1 KB).
+Adding surface area may re-breach the limit.

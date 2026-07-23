@@ -18,7 +18,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     // ---- Open ----
 
     function openPosition(Order calldata order, uint256 fillPrice, bytes calldata userSig)
-        external override onlyMaker nonReentrant whenNotHalted whenNotPausedNew returns (uint256 id)
+        external override nonReentrant whenNotHalted whenNotPausedNew returns (uint256 id)
     {
         if (!order.isOpen) revert BadUserSig();
         _verifyAndConsumeOrder(order, userSig);
@@ -27,33 +27,34 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     }
 
     function _openPosition(Order calldata order, uint256 fillPrice_1e18) internal returns (uint256 id) {
-        ParamCatalog.TokenParams storage cfg = _params[order.token];
-        if (cfg.structural.priceTick == 0) revert UnknownToken();
+        ParamCatalog.Structural storage s = _params[order.token].structural;
+        if (s.priceTick == 0) revert UnknownToken();
+        ParamCatalog.Risk storage risk = _makerRisk[order.maker][order.token];
         if (order.size == 0 || order.leverage == 0) revert BadSize();
-        if (activePositionId[order.user][order.token] != 0) revert PositionExists();
+        if (activePositionId[order.user][order.maker][order.token] != 0) revert PositionExists();
 
-        uint128 fillPriceUnits = _toPriceUnits(fillPrice_1e18, cfg.structural.priceTick);
-        uint128 sizeUnits      = _toSizeUnits(order.size, cfg.structural.sizeTick);
+        uint128 fillPriceUnits = _toPriceUnits(fillPrice_1e18, s.priceTick);
+        uint128 sizeUnits      = _toSizeUnits(order.size, s.sizeTick);
 
-        uint256 markNotional = _notional(fillPriceUnits, sizeUnits, cfg.structural.notionalScale);
+        uint256 markNotional = _notional(fillPriceUnits, sizeUnits, s.notionalScale);
         uint256 collateral_  = markNotional / order.leverage;
         if (collateral_ == 0) revert BadSize();
 
-        if (order.leverage < cfg.structural.minLeverage || order.leverage > cfg.structural.maxLeverage) revert BadLeverage();
-        if (markNotional > cfg.risk.maxPositionNotional) revert PositionNotionalCap();
+        if (order.leverage < s.minLeverage || order.leverage > s.maxLeverage) revert BadLeverage();
+        if (markNotional > risk.maxPositionNotional) revert PositionNotionalCap();
 
-        uint256 newLong  = openInterestLong[order.token];
-        uint256 newShort = openInterestShort[order.token];
+        uint256 newLong  = openInterestLong[order.maker][order.token];
+        uint256 newShort = openInterestShort[order.maker][order.token];
         if (order.isLong) newLong  += markNotional;
         else              newShort += markNotional;
         {
             uint256 gross = newLong + newShort;
             uint256 skew  = newLong > newShort ? newLong - newShort : newShort - newLong;
-            if (gross > cfg.risk.maxOIGross) revert OIGrossCap();
-            if (skew  > cfg.risk.maxOISkew)  revert OISkewCap();
+            if (gross > risk.maxOIGross) revert OIGrossCap();
+            if (skew  > risk.maxOISkew)  revert OISkewCap();
         }
 
-        uint256 fee = (markNotional * cfg.risk.openFeeBps) / ParamCatalog.BPS_DENOM;
+        uint256 fee = (markNotional * risk.openFeeBps) / ParamCatalog.BPS_DENOM;
         uint256 collAfterFee = collateral_;
         if (fee > 0) {
             if (collAfterFee <= fee) revert Insolvent();
@@ -61,12 +62,11 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         }
 
         usdm.safeTransferFrom(order.user, address(this), collateral_);
-        if (fee > 0) collateral[MAKER_POOL][order.token] += fee;
+        if (fee > 0) collateral[order.maker][order.token] += fee;
 
-        _pushMark(order.token, fillPrice_1e18, _markState[order.token].currentRatePct, false);
+        _pushMark(order.maker, order.token, fillPrice_1e18, _markState[order.maker][order.token].currentRatePct, false);
 
-        MarkState storage st = _markState[order.token];
-        int128 fundingNow = _indexNow(st, cfg.structural.priceTick);
+        int128 fundingNow = _indexNow(_markState[order.maker][order.token], s.priceTick);
 
         id = ++nextPositionId;
         if (order.leverage > type(uint16).max) revert BadLeverage();
@@ -87,14 +87,15 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
             fundingCheckpoint: fundingNow,
             realizedPnl:       0,
             notionalAtOpen:    uint128(markNotional),
-            makerCutPaid:      0
+            makerCutPaid:      0,
+            maker:             order.maker
         });
-        activePositionId[order.user][order.token] = id;
-        openInterestLong[order.token]  = newLong;
-        openInterestShort[order.token] = newShort;
+        activePositionId[order.user][order.maker][order.token] = id;
+        openInterestLong[order.maker][order.token]  = newLong;
+        openInterestShort[order.maker][order.token] = newShort;
 
         emit PositionOpened(
-            id, order.user, order.token, msg.sender, order.isLong, order.size,
+            id, order.user, order.token, order.maker, order.isLong, order.size,
             fillPrice_1e18, collAfterFee, uint64(block.timestamp), fundingNow
         );
     }
@@ -102,7 +103,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     // ---- Increase (size up) ----
 
     function increasePosition(Order calldata order, uint256 fillPrice, bytes calldata userSig)
-        external override onlyMaker nonReentrant whenNotHalted whenNotPausedNew returns (uint256 id)
+        external override nonReentrant whenNotHalted whenNotPausedNew returns (uint256 id)
     {
         if (!order.isOpen) revert BadUserSig();
         _verifyAndConsumeOrder(order, userSig);
@@ -111,38 +112,41 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     }
 
     function _increasePosition(Order calldata order, uint256 fillPrice_1e18) internal returns (uint256 id) {
-        ParamCatalog.TokenParams storage cfg = _params[order.token];
-        if (cfg.structural.priceTick == 0) revert UnknownToken();
+        ParamCatalog.Structural storage s = _params[order.token].structural;
+        if (s.priceTick == 0) revert UnknownToken();
+        ParamCatalog.Risk storage risk = _makerRisk[order.maker][order.token];
         if (order.size == 0 || order.leverage == 0) revert BadSize();
 
-        id = activePositionId[order.user][order.token];
+        id = activePositionId[order.user][order.maker][order.token];
         if (id == 0) revert NoPosition();
         Position storage p = _positions[id];
         if (order.isLong   != p.isLong)   revert BadUserSig();
         if (order.leverage != p.leverage) revert BadUserSig();
+        // order.maker == msg.sender == p.maker (submitter is verified against order.maker, and the
+        // position was keyed by (user, maker, token)), so the maker match is already guaranteed.
 
-        uint128 fillPriceUnits = _toPriceUnits(fillPrice_1e18, cfg.structural.priceTick);
-        uint128 addSizeUnits   = _toSizeUnits(order.size, cfg.structural.sizeTick);
+        uint128 fillPriceUnits = _toPriceUnits(fillPrice_1e18, s.priceTick);
+        uint128 addSizeUnits   = _toSizeUnits(order.size, s.sizeTick);
 
-        uint256 addNotional   = _notional(fillPriceUnits, addSizeUnits, cfg.structural.notionalScale);
+        uint256 addNotional   = _notional(fillPriceUnits, addSizeUnits, s.notionalScale);
         uint256 addCollateral = addNotional / order.leverage;
         if (addCollateral == 0) revert BadSize();
 
         uint256 totalNotional = uint256(p.notionalAtOpen) + addNotional;
-        if (totalNotional > cfg.risk.maxPositionNotional) revert PositionNotionalCap();
+        if (totalNotional > risk.maxPositionNotional) revert PositionNotionalCap();
 
-        uint256 newLong  = openInterestLong[order.token];
-        uint256 newShort = openInterestShort[order.token];
+        uint256 newLong  = openInterestLong[order.maker][order.token];
+        uint256 newShort = openInterestShort[order.maker][order.token];
         if (order.isLong) newLong += addNotional; else newShort += addNotional;
         {
             uint256 gross = newLong + newShort;
             uint256 skew  = newLong > newShort ? newLong - newShort : newShort - newLong;
-            if (gross > cfg.risk.maxOIGross) revert OIGrossCap();
-            if (skew  > cfg.risk.maxOISkew)  revert OISkewCap();
+            if (gross > risk.maxOIGross) revert OIGrossCap();
+            if (skew  > risk.maxOISkew)  revert OISkewCap();
         }
 
         // open fee charged only on the added size
-        uint256 fee = (addNotional * cfg.risk.openFeeBps) / ParamCatalog.BPS_DENOM;
+        uint256 fee = (addNotional * risk.openFeeBps) / ParamCatalog.BPS_DENOM;
         uint256 addColAfterFee = addCollateral;
         if (fee > 0) {
             if (addColAfterFee <= fee) revert Insolvent();
@@ -150,11 +154,10 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         }
 
         usdm.safeTransferFrom(order.user, address(this), addCollateral);
-        if (fee > 0) collateral[MAKER_POOL][order.token] += fee;
+        if (fee > 0) collateral[order.maker][order.token] += fee;
 
-        _pushMark(order.token, fillPrice_1e18, _markState[order.token].currentRatePct, false);
-        MarkState storage st = _markState[order.token];
-        int128 fundingNow = _indexNow(st, _params[order.token].structural.priceTick);
+        _pushMark(order.maker, order.token, fillPrice_1e18, _markState[order.maker][order.token].currentRatePct, false);
+        int128 fundingNow = _indexNow(_markState[order.maker][order.token], s.priceTick);
 
         // Size-weighted blends preserve the old size's unrealized PnL and accrued funding
         // exactly, while the added size enters at fillPrice / current funding.
@@ -180,13 +183,13 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         // Resetting openTime moves that floor; it also restarts the max-duration expiry clock.
         p.openTime          = uint64(block.timestamp);
 
-        openInterestLong[order.token]  = newLong;
-        openInterestShort[order.token] = newShort;
+        openInterestLong[order.maker][order.token]  = newLong;
+        openInterestShort[order.maker][order.token] = newShort;
 
         emit PositionIncreased(
-            id, msg.sender, order.size, fillPrice_1e18,
-            _sizeOut(uint128(newSize), cfg.structural.sizeTick),
-            _priceOut(uint128(newEntry), cfg.structural.priceTick),
+            id, order.maker, order.size, fillPrice_1e18,
+            _sizeOut(uint128(newSize), s.sizeTick),
+            _priceOut(uint128(newEntry), s.priceTick),
             addColAfterFee, fee, int128(newCheckpoint)
         );
     }
@@ -194,14 +197,14 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     // ---- Close ----
 
     function closePosition(Order calldata order, uint256 fillPrice, bytes calldata userSig)
-        external override onlyMaker nonReentrant whenNotHalted
+        external override nonReentrant whenNotHalted
     {
         if (order.isOpen) revert BadUserSig();
         _verifyAndConsumeOrder(order, userSig);
         _checkSlippageBand(fillPrice, order.targetPrice, order.maxSlippageBps);
 
         ParamCatalog.TokenParams storage cfg = _params[order.token];
-        uint256 id = activePositionId[order.user][order.token];
+        uint256 id = activePositionId[order.user][order.maker][order.token];
         if (id == 0) revert NoPosition();
 
         Position storage p = _positions[id];
@@ -209,9 +212,9 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         uint128 closeSizeUnits = _toSizeUnits(order.size, cfg.structural.sizeTick);
         if (closeSizeUnits > p.size) revert BadUserSig();
 
-        _pushMark(order.token, fillPrice, _markState[order.token].currentRatePct, false);
+        _pushMark(order.maker, order.token, fillPrice, _markState[order.maker][order.token].currentRatePct, false);
 
-        (bool liqFound, uint128 markAtLiqUnits, uint16 ringStep) = _ringWalkForLiq(order.token, id);
+        (bool liqFound, uint128 markAtLiqUnits, uint16 ringStep) = _ringWalkForLiq(order.maker, order.token, id);
         if (liqFound) {
             _wipePosition(id, markAtLiqUnits, ringStep);
             return;
@@ -231,7 +234,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         if (p.closed) revert PositionAlreadyClosed();
         ParamCatalog.TokenParams storage cfg = _params[p.token];
         if (block.timestamp < p.openTime + cfg.structural.maxPositionDuration) revert PositionDurationNotElapsed();
-        MarkState storage st = _markState[p.token];
+        MarkState storage st = _markState[p.maker][p.token];
         uint256 payout_ = _settleClose(id, st.currentMark);
         uint256 closePrice_1e18 = _priceOut(st.currentMark, cfg.structural.priceTick);
         emit PositionExpired(id, closePrice_1e18, payout_);
@@ -240,15 +243,15 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     function _settleClose(uint256 id, uint128 closePriceUnits) internal returns (uint256) {
         Position storage p = _positions[id];
         ParamCatalog.TokenParams storage cfg = _params[p.token];
-        MarkState storage st = _markState[p.token];
+        MarkState storage st = _markState[p.maker][p.token];
 
         int128 fundingNow = _indexNow(st, cfg.structural.priceTick);
 
         (int256 pnl, int256 fundingPaid, uint256 payout, uint256 makerCut) =
             _settle(p, closePriceUnits, fundingNow, cfg.structural);
 
-        _applyMakerPoolDelta(p.token, p.col, pnl, fundingPaid, makerCut);
-        _decreaseOI(p.token, p.isLong, uint256(p.notionalAtOpen));
+        _applyMakerPoolDelta(p.maker, p.token, p.col, pnl, fundingPaid, makerCut);
+        _decreaseOI(p.maker, p.token, p.isLong, uint256(p.notionalAtOpen));
 
         int256 effPnl = pnl - fundingPaid;
         p.closed       = true;
@@ -258,7 +261,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         // notional (which fits uint128).
         p.realizedPnl  = int128(effPnl);
         p.makerCutPaid = uint128(makerCut);
-        activePositionId[p.user][p.token] = 0;
+        activePositionId[p.user][p.maker][p.token] = 0;
 
         address user = p.user;
         uint256 closePrice_1e18 = _priceOut(closePriceUnits, cfg.structural.priceTick);
@@ -273,7 +276,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     {
         Position storage p = _positions[id];
         ParamCatalog.TokenParams storage cfg = _params[p.token];
-        MarkState storage st = _markState[p.token];
+        MarkState storage st = _markState[p.maker][p.token];
 
         int128 fundingNow = _indexNow(st, cfg.structural.priceTick);
 
@@ -282,10 +285,10 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         (int256 pnl, int256 fundingPaid, uint256 payout, uint256 makerCut) =
             _settleSlice(p, closeSizeUnits, colPortion, closePriceUnits, fundingNow, cfg.structural);
 
-        _applyMakerPoolDelta(p.token, colPortion, pnl, fundingPaid, makerCut);
+        _applyMakerPoolDelta(p.maker, p.token, colPortion, pnl, fundingPaid, makerCut);
 
         uint256 notionalPortion = uint256(p.notionalAtOpen) * closeSizeUnits / p.size;
-        _decreaseOI(p.token, p.isLong, notionalPortion);
+        _decreaseOI(p.maker, p.token, p.isLong, notionalPortion);
 
         // shrink the position; entry, funding checkpoint and leverage are unchanged
         p.size           = p.size - closeSizeUnits;
@@ -305,38 +308,38 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     function _wipePosition(uint256 id, uint128 markAtLiqUnits, uint16 ringStep) internal {
         Position storage p = _positions[id];
         uint256 wiped = uint256(p.col);
-        _decreaseOI(p.token, p.isLong, uint256(p.notionalAtOpen));
-        collateral[MAKER_POOL][p.token] += wiped;
+        _decreaseOI(p.maker, p.token, p.isLong, uint256(p.notionalAtOpen));
+        collateral[p.maker][p.token] += wiped;
         p.closed       = true;
         p.closeTime    = uint64(block.timestamp);
         p.closePrice   = markAtLiqUnits;
         p.realizedPnl  = -int128(int256(wiped));
-        activePositionId[p.user][p.token] = 0;
+        activePositionId[p.user][p.maker][p.token] = 0;
         uint256 mark_1e18 = _priceOut(markAtLiqUnits, _params[p.token].structural.priceTick);
         emit PositionLiquidated(id, mark_1e18, ringStep, wiped);
     }
 
-    function _applyMakerPoolDelta(address token, uint256 posCol, int256 pnl, int256 fundingPaid, uint256 makerCut) internal {
+    function _applyMakerPoolDelta(address maker, address token, uint256 posCol, int256 pnl, int256 fundingPaid, uint256 makerCut) internal {
         int256 effPnl = pnl - fundingPaid;
-        uint256 makerPoolBal = collateral[MAKER_POOL][token];
+        uint256 makerPoolBal = collateral[maker][token];
         if (effPnl > 0) {
             uint256 win = uint256(effPnl);
             if (makerPoolBal < win) revert Insolvent();
-            unchecked { collateral[MAKER_POOL][token] = makerPoolBal - win + makerCut; }
+            unchecked { collateral[maker][token] = makerPoolBal - win + makerCut; }
         } else {
             uint256 loss = uint256(-effPnl);
             if (loss > posCol) loss = posCol;
-            collateral[MAKER_POOL][token] += loss;
+            collateral[maker][token] += loss;
         }
     }
 
-    function _decreaseOI(address token, bool isLong, uint256 notionalAtOpen) internal {
+    function _decreaseOI(address maker, address token, bool isLong, uint256 notionalAtOpen) internal {
         if (isLong) {
-            uint256 oi = openInterestLong[token];
-            openInterestLong[token] = oi > notionalAtOpen ? oi - notionalAtOpen : 0;
+            uint256 oi = openInterestLong[maker][token];
+            openInterestLong[maker][token] = oi > notionalAtOpen ? oi - notionalAtOpen : 0;
         } else {
-            uint256 oi = openInterestShort[token];
-            openInterestShort[token] = oi > notionalAtOpen ? oi - notionalAtOpen : 0;
+            uint256 oi = openInterestShort[maker][token];
+            openInterestShort[maker][token] = oi > notionalAtOpen ? oi - notionalAtOpen : 0;
         }
     }
 
@@ -386,18 +389,20 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
 
     // ---- Liquidate ----
 
+    /// @notice Liquidate positions on the caller's OWN book. `newMark` (if nonzero) is pushed to
+    /// (msg.sender, token) first. Only positions whose counterparty is msg.sender are considered.
     function liquidate(address token, uint256 newMark, uint256[] calldata positionIds)
-        external override onlyMaker nonReentrant whenNotHalted
+        external override nonReentrant whenNotHalted
     {
         if (newMark != 0) {
-            _pushMark(token, newMark, _markState[token].currentRatePct, false);
+            _pushMark(msg.sender, token, newMark, _markState[msg.sender][token].currentRatePct, false);
         }
         uint256 wipedCount = 0;
         for (uint256 i = 0; i < positionIds.length; i++) {
             uint256 id = positionIds[i];
             Position storage p = _positions[id];
-            if (p.user == address(0) || p.closed || p.token != token) continue;
-            (bool liqFound, uint128 markAtLiqUnits, uint16 ringStep) = _ringWalkForLiq(token, id);
+            if (p.user == address(0) || p.closed || p.token != token || p.maker != msg.sender) continue;
+            (bool liqFound, uint128 markAtLiqUnits, uint16 ringStep) = _ringWalkForLiq(msg.sender, token, id);
             if (!liqFound) continue;
             _wipePosition(id, markAtLiqUnits, ringStep);
             wipedCount++;
@@ -405,12 +410,12 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         if (wipedCount == 0) revert NoneLiquidated();
     }
 
-    function _ringWalkForLiq(address token, uint256 id)
+    function _ringWalkForLiq(address maker, address token, uint256 id)
         internal view returns (bool found, uint128 markAtLiqUnits, uint16 ringStep)
     {
         Position storage p = _positions[id];
         if (p.user == address(0) || p.closed) return (false, 0, 0);
-        MarkState storage st = _markState[token];
+        MarkState storage st = _markState[maker][token];
         if (st.lastPushAt == 0) return (false, 0, 0);
         ParamCatalog.TokenParams storage cfg = _params[token];
 
@@ -427,7 +432,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         uint256 available = head < MarkRing.RING_LEN ? head : MarkRing.RING_LEN;
         for (uint256 k = 1; k <= available; k++) {
             uint256 idx = head - k;
-            uint32 markE = MarkRing.readMarkEntry(_markRing[token], idx);
+            uint32 markE = MarkRing.readMarkEntry(_markRing[maker][token], idx);
             if (MarkRing.isSentinel(markE)) return (false, 0, 0);
             (int256 priceDelta, uint256 timeDelta10) = MarkRing.unpackEntry(markE);
             uint64 durationSec = uint64(timeDelta10 * MarkRing.GAP_UNIT_MS / 1000);
@@ -441,7 +446,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
                 _isLiquidatable(p, markAtK, indexAtK, cfg.structural.sizeTick, cfg.structural.notionalScale)) {
                 return (true, markAtK, uint16(k));
             }
-            ratePct = MarkRing.readRateEntry(_rateRing[token], idx);
+            ratePct = MarkRing.readRateEntry(_rateRing[maker][token], idx);
         }
         return (false, 0, 0);
     }
@@ -504,7 +509,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
 
     function _fundingOwed(Position storage p, ParamCatalog.Structural storage s) internal view returns (int256) {
         if (p.user == address(0) || p.closed) return 0;
-        MarkState storage st = _markState[p.token];
+        MarkState storage st = _markState[p.maker][p.token];
         int128 indexNow = _indexNow(st, s.priceTick);
         int256 delta = int256(indexNow) - int256(p.fundingCheckpoint);
         if (!p.isLong) delta = -delta;

@@ -9,16 +9,14 @@ import { HitOnePositions }   from "./HitOnePositions.sol";
 import { HitOneAdmin }       from "./HitOneAdmin.sol";
 
 /// @title HitOneMarket
-/// @notice User-signed-order + maker-submitted perp venue.
+/// @notice User-signed-order perp venue with permissionless, fully isolated per-maker sub-markets.
 contract HitOneMarket is HitOnePositions, HitOneAdmin {
-    constructor(address owner_, address maker_, address usdm_)
+    constructor(address owner_, address usdm_)
         HitOneStorage(usdm_)
         Ownable(owner_)
         EIP712("HitOneMarket", "1")
     {
-        if (maker_ != address(0)) {
-            isMaker[maker_] = true;
-            emit MakerSet(maker_, true);
-        }
+        // No initial maker: registration is permissionless. The owner curates tokens (setToken)
+        // and the halter set; makers self-register by configuring risk + funding a pool.
     }
 }

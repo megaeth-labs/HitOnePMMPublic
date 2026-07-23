@@ -13,14 +13,16 @@ import { FundingIndex }      from "../common/FundingIndex.sol";
 abstract contract HitOneMarks is HitOneStorage {
     // ---- Mark + funding (admin) ----
 
-    function setMark(address token, uint256 newMark) external override onlyMaker whenNotHalted {
-        _pushMark(token, newMark, _markState[token].currentRatePct, false);
+    /// @notice Push a mark to the caller's OWN (msg.sender, token) book. Permissionless — anyone
+    /// may quote their own market on a registered token.
+    function setMark(address token, uint256 newMark) external override whenNotHalted {
+        _pushMark(msg.sender, token, newMark, _markState[msg.sender][token].currentRatePct, false);
     }
     // newRate is a signed fixed-point funding FRACTION per second (real = newRate / (100 * 2**63)),
     // NOT a price-scaled amount. The int64 range inherently caps it at ±1%/sec, so no explicit
     // bound check is needed. See IHitOneMarket.setMarkAndRate for the full semantics.
-    function setMarkAndRate(address token, uint256 newMark, int64 newRate) external override onlyMaker whenNotHalted {
-        _pushMark(token, newMark, newRate, true);
+    function setMarkAndRate(address token, uint256 newMark, int64 newRate) external override whenNotHalted {
+        _pushMark(msg.sender, token, newMark, newRate, true);
     }
 
     /// @dev Project the committed funding index forward to now, folding the live funding rate into
@@ -32,23 +34,23 @@ abstract contract HitOneMarks is HitOneStorage {
         );
     }
 
-    function _pushMark(address token, uint256 newMark_1e18, int64 nextRate, bool isRateChange) internal {
-        ParamCatalog.TokenParams storage cfg = _params[token];
-        if (cfg.structural.priceTick == 0) revert UnknownToken();
-        uint128 newMarkUnits = _toPriceUnits(newMark_1e18, cfg.structural.priceTick);
+    function _pushMark(address maker, address token, uint256 newMark_1e18, int64 nextRate, bool isRateChange) internal {
+        ParamCatalog.Structural storage s = _params[token].structural;
+        if (s.priceTick == 0) revert UnknownToken();
+        uint128 newMarkUnits = _toPriceUnits(newMark_1e18, s.priceTick);
 
-        _checkOracleBand(token, newMark_1e18, cfg.risk.maxDevBps);
+        _checkOracleBand(token, newMark_1e18);
         uint256 microTs = _microTimestamp();
         uint64 nowMs = uint64(microTs / 1000);
 
-        MarkState storage st = _markState[token];
+        MarkState storage st = _markState[maker][token];
         if (st.lastPushAt == 0) {
             st.currentMark = newMarkUnits;
             st.lastPushAt  = uint64(block.timestamp);
             st.lastPushMs  = nowMs;
             st.currentRatePct = nextRate;
-            emit MarkPushed(token, newMark_1e18, 0, 0, false, microTs);
-            if (isRateChange) emit FundingRateChanged(token, 0, nextRate, uint64(block.timestamp));
+            emit MarkPushed(maker, token, newMark_1e18, 0, 0, false, microTs);
+            if (isRateChange) emit FundingRateChanged(maker, token, 0, nextRate, uint64(block.timestamp));
             return;
         }
 
@@ -59,7 +61,7 @@ abstract contract HitOneMarks is HitOneStorage {
         int64 oldRate = st.currentRatePct;
         // Accrue the elapsed interval at the OLD rate and OLD mark (both still live here — the
         // mark is a step function held until this push overwrites it below).
-        st.fundingIndex = _indexNow(st, cfg.structural.priceTick);
+        st.fundingIndex = _indexNow(st, s.priceTick);
 
         int256 priceDelta;
         unchecked {
@@ -73,13 +75,13 @@ abstract contract HitOneMarks is HitOneStorage {
         uint32 markEntry;
         if (sentinel) {
             markEntry = MarkRing.sentinelEntry();
-            emit MarkPushed(token, newMark_1e18, priceDelta, 0, true, microTs);
+            emit MarkPushed(maker, token, newMark_1e18, priceDelta, 0, true, microTs);
         } else {
             markEntry = MarkRing.packEntry(priceDelta, elapsedUnits);
-            emit MarkPushed(token, newMark_1e18, priceDelta, uint16(elapsedUnits), false, microTs);
+            emit MarkPushed(maker, token, newMark_1e18, priceDelta, uint16(elapsedUnits), false, microTs);
         }
-        MarkRing.writeMarkEntry(_markRing[token], head, markEntry);
-        MarkRing.writeRateEntry(_rateRing[token], head, oldRate);
+        MarkRing.writeMarkEntry(_markRing[maker][token], head, markEntry);
+        MarkRing.writeRateEntry(_rateRing[maker][token], head, oldRate);
 
         st.ringHead    = head + 1;
         st.currentMark = newMarkUnits;
@@ -88,7 +90,7 @@ abstract contract HitOneMarks is HitOneStorage {
 
         if (isRateChange) {
             st.currentRatePct = nextRate;
-            emit FundingRateChanged(token, oldRate, nextRate, uint64(block.timestamp));
+            emit FundingRateChanged(maker, token, oldRate, nextRate, uint64(block.timestamp));
         }
     }
 
@@ -103,7 +105,9 @@ abstract contract HitOneMarks is HitOneStorage {
         return uint256(block.timestamp) * 1_000_000;
     }
 
-    function _checkOracleBand(address token, uint256 newMark_1e18, uint256 maxDevBps) internal view {
+    /// @dev Owner-set per-token band: every maker's marks on `token` are checked against the same
+    /// oracle feed and `maxDevBps`, so a maker cannot loosen it. Skipped entirely when `feed == 0`.
+    function _checkOracleBand(address token, uint256 newMark_1e18) internal view {
         OracleConfig storage oc = _oracleConfig[token];
         address feed = oc.feed;
         if (feed == address(0)) return;
@@ -112,68 +116,27 @@ abstract contract HitOneMarks is HitOneStorage {
         if (block.timestamp > updatedAt + uint256(oc.maxStale))    revert OracleStale();
         uint256 oraclePx = uint256(answer) * (10 ** (18 - uint256(oc.decimals)));
         uint256 diff = newMark_1e18 > oraclePx ? newMark_1e18 - oraclePx : oraclePx - newMark_1e18;
-        if (diff * ParamCatalog.BPS_DENOM > maxDevBps * oraclePx) revert MarkOutOfOracleBand();
+        if (diff * ParamCatalog.BPS_DENOM > uint256(oc.maxDevBps) * oraclePx) revert MarkOutOfOracleBand();
     }
 
     // ---- Mark-domain views ----
 
-    function marketOf(address token) external view override returns (MarketView memory) {
-        MarkState storage st = _markState[token];
+    function marketOf(address maker, address token) external view override returns (MarketView memory) {
+        MarkState storage st = _markState[maker][token];
         return MarketView({
             mark:             _priceOut(st.currentMark, _params[token].structural.priceTick),
             fundingIndex:     st.fundingIndex,
             currentRatePct:      st.currentRatePct,
             ringHead:         st.ringHead,
-            openInterestLong:  openInterestLong[token],
-            openInterestShort: openInterestShort[token]
+            openInterestLong:  openInterestLong[maker][token],
+            openInterestShort: openInterestShort[maker][token]
         });
     }
-    function rateRingAt(address token, uint16 idx) external view override returns (int64) {
-        return MarkRing.readRateEntry(_rateRing[token], idx);
+    function rateRingAt(address maker, address token, uint16 idx) external view override returns (int64) {
+        return MarkRing.readRateEntry(_rateRing[maker][token], idx);
     }
 
-    function reconstructAt(address token, uint16 entries) external view override returns (
-        uint256 markAtK, int128 fundingAtK, uint64 timeAtK
-    ) {
-        MarkState storage st = _markState[token];
-        uint64 nowT = uint64(block.timestamp);
-        if (st.lastPushAt == 0 || entries == 0) {
-            return (
-                _priceOut(st.currentMark, _params[token].structural.priceTick),
-                _indexNow(st, _params[token].structural.priceTick),
-                nowT
-            );
-        }
-        return _reconstructWalk(token, entries);
-    }
-
-    function _reconstructWalk(address token, uint16 entries) internal view returns (
-        uint256 markAtK_1e18, int128 fundingAtK, uint64 timeAtK
-    ) {
-        MarkState storage st = _markState[token];
-        ParamCatalog.Structural storage s = _params[token].structural;
-        uint256 markAtKUnits = uint256(st.currentMark);
-        fundingAtK = _indexNow(st, s.priceTick);
-        timeAtK    = uint64(block.timestamp);
-        int64 ratePct = st.currentRatePct;
-
-        uint256 head = st.ringHead;
-        uint256 available = head < MarkRing.RING_LEN ? head : MarkRing.RING_LEN;
-        uint256 limit = entries < available ? entries : available;
-        for (uint256 k = 1; k <= limit; k++) {
-            uint256 idx = head - k;
-            uint32 me = MarkRing.readMarkEntry(_markRing[token], idx);
-            if (MarkRing.isSentinel(me)) return (0, 0, 0);
-            (int256 pDelta, uint256 td10) = MarkRing.unpackEntry(me);
-            uint64 durationSec = uint64(td10 * MarkRing.GAP_UNIT_MS / 1000);
-            // Step the index back over this segment at its fixed-point rate and the mark held during it.
-            fundingAtK = FundingIndex.stepBackPct(fundingAtK, ratePct, markAtKUnits * s.priceTick, durationSec);
-            timeAtK   -= durationSec;
-            int256 prev = int256(markAtKUnits) - pDelta;
-            if (prev <= 0) return (0, 0, 0);
-            markAtKUnits = uint256(prev);
-            ratePct = MarkRing.readRateEntry(_rateRing[token], idx);
-        }
-        markAtK_1e18 = markAtKUnits * s.priceTick;
-    }
+    // NOTE: `reconstructAt` (historical mark/funding walk-back view) was removed to fit the
+    // EIP-170 contract-size limit. Off-chain consumers reconstruct the same values from the
+    // `MarkPushed` (priceDelta + timeDeltaMs) and `FundingRateChanged` event streams.
 }

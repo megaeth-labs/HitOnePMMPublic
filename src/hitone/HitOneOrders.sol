@@ -14,14 +14,16 @@ abstract contract HitOneOrders is HitOneStorage {
     function _orderDigest(Order calldata o) internal view returns (bytes32) {
         bytes32 sh = keccak256(abi.encode(
             ORDER_TYPEHASH,
-            o.user, o.token, o.isLong, o.isOpen, o.size, o.leverage,
+            o.user, o.maker, o.token, o.isLong, o.isOpen, o.size, o.leverage,
             o.targetPrice, o.maxSlippageBps, o.deadline, o.channel, o.nonce
         ));
         return _hashTypedDataV4(sh);
     }
 
-    /// @dev Verify sig + consume nonce. Returns (no value).
+    /// @dev Verify sig + consume nonce. The submitter MUST be the exact maker the user signed for
+    /// (`o.maker`), so flow can't be stolen by another maker.
     function _verifyAndConsumeOrder(Order calldata o, bytes calldata sig) internal {
+        if (msg.sender != o.maker) revert WrongMaker();
         if (block.timestamp > o.deadline) revert OrderExpired();
         if (nonceUsed[o.user][o.channel][o.nonce]) revert NonceAlreadyUsed();
         address signer = ECDSA.recover(_orderDigest(o), sig);

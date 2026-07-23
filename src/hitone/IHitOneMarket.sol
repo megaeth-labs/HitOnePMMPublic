@@ -15,31 +15,45 @@ import { ParamCatalog }  from "../common/ParamCatalog.sol";
 /// behalf. This gives the maker a final say on the exact fill price (committed at submission
 /// time) while letting the user enforce their own price limit.
 ///
-/// Roles:
-///   - owner   — overall admin
-///   - maker   — submits user-signed orders on-chain, pushes marks/rates, liquidates
-///               (multiple makers allowed)
-///   - funder  — supplies + withdraws maker-pool collateral
-///   - halter  — emergency halt/unhalt (see `halt`)
+/// Each `(maker, token)` is a fully isolated sub-market: its own marks, funding, risk limits,
+/// open interest and collateral pool. A user picks the exact `(token, maker)` they trade against
+/// by naming `maker` in their signed order.
 ///
-/// No taker role. The maker is the sole on-chain submitter for opens and closes.
+/// Roles:
+///   - owner   — curates the token universe (`setToken` structural grid, `setOracle`), the
+///               timelocked `halter` set, and `setWithdrawDelay`. Cannot touch maker funds.
+///   - maker   — PERMISSIONLESS: any address may run a book on an owner-registered token. Pushes
+///               its own marks/rates, sets its own risk (`setRiskLimits`), opens/closes/liquidates
+///               its own positions, and is the counterparty to them. No registration step.
+///   - funder  — per-maker treasury key (`makerFunder[maker]`), self-set by the maker; funds +
+///               withdraws that maker's pool. Defaults to the maker itself when unset.
+///   - halter  — emergency halt/unhalt; multiple allowed, assigned via the timelocked role queue
+///               (`queueSetHalter`). ONLY halters may halt/unhalt — not makers, funders, or owner.
 ///
 /// **Collateral model.** Users hold no internal balance. They grant USDM allowance to this
 /// contract; on open/increase the required collateral is pulled from the user's wallet, and
-/// on close/decrease the payout is sent back to the user's wallet. Only the maker pool keeps
-/// an internal balance, funded by the funder via `fundMakerPool` and withdrawn through the
-/// timelocked queue.
+/// on close/decrease the payout is sent back to the user's wallet. Each maker keeps its own
+/// segregated internal balance (`collateral[maker][token]`) and is the counterparty to the
+/// positions it opens; PnL for a position settles only against its own maker's pool.
 ///
 /// Positions are id-indexed and retained after close. At most one active position per
-/// `(user, token)`.
+/// `(user, maker, token)`.
 interface IHitOneMarket {
     // ============================================================
     // events
     // ============================================================
 
-    event MakerSet(address indexed maker, bool allowed);
-    event FunderSet(address indexed funder);
-    event HalterSet(address indexed halter);
+    event MakerFunderSet(address indexed maker, address indexed funder);
+    event HalterSet(address indexed halter, bool allowed);
+    event WithdrawDelaySet(uint256 delay);
+
+    /// @notice Halter role change queued behind `roleChangeDelay()`. `kind` is always 2 (halter);
+    /// `account` is the halter target and `allowed` the grant/revoke flag. (`subject` unused.)
+    event RoleChangeQueued(
+        uint256 indexed id, uint8 kind, address subject, address account, bool allowed, uint64 readyAt
+    );
+    event RoleChangeExecuted(uint256 indexed id);
+    event RoleChangeCancelled(uint256 indexed id);
 
     /// @notice Emitted when the market is halted or the halt window is extended. `haltedUntil`
     /// is the earliest timestamp at which `unhalt` may succeed.
@@ -47,12 +61,14 @@ interface IHitOneMarket {
     event Unhalted(address indexed by);
 
     event TokenSet(address indexed token, ParamCatalog.Structural structural);
-    event RiskLimitsSet(address indexed token, ParamCatalog.Risk risk);
-    event OracleSet(address indexed token, address feed, uint8 decimals, uint32 maxStale);
+    event RiskLimitsSet(address indexed maker, address indexed token, ParamCatalog.Risk risk);
+    event OracleSet(address indexed token, address feed, uint8 decimals, uint32 maxStale, uint16 maxDevBps);
 
-    event MakerPoolFunded(address indexed from, address indexed token, uint256 amount);
+    event MakerPoolFunded(address indexed maker, address indexed from, address indexed token, uint256 amount);
 
-    event MakerPoolWithdrawalQueued(uint256 indexed id, address indexed token, address to, uint256 amount, uint64 readyAt);
+    event MakerPoolWithdrawalQueued(
+        uint256 indexed id, address indexed maker, address indexed token, address to, uint256 amount, uint64 readyAt
+    );
     event MakerPoolWithdrawalExecuted(uint256 indexed id);
     event MakerPoolWithdrawalCancelled(uint256 indexed id);
 
@@ -61,6 +77,7 @@ interface IHitOneMarket {
     /// each mark was posted at a plausible time; it falls back to `block.timestamp × 1e6` when the
     /// system contract is unavailable.
     event MarkPushed(
+        address indexed maker,
         address indexed token,
         uint256 newMark,
         int256  priceDelta,
@@ -68,7 +85,7 @@ interface IHitOneMarket {
         bool    isSentinel,
         uint256 microTimestamp
     );
-    event FundingRateChanged(address indexed token, int64 oldRate, int64 newRate, uint64 startTime);
+    event FundingRateChanged(address indexed maker, address indexed token, int64 oldRate, int64 newRate, uint64 startTime);
 
     /// @notice Off-chain indexers can use `(channel, nonce)` to flag a user order as spent.
     event NonceUsed(address indexed user, uint256 indexed channel, uint256 indexed nonce);
@@ -142,14 +159,16 @@ interface IHitOneMarket {
     // errors
     // ============================================================
 
-    error NotMaker();
     error NotFunder();
+    error WrongMaker();
     error NotHalter();
-    error NotHaltAuth();
     error NotPausedNewAuth();
     error MarketHalted();
     error NotHalted();
     error HaltCooldownActive();
+    error RoleChangeUnknown();
+    error RoleChangeNotReady();
+    error BadWithdrawDelay();
     error ZeroAddress();
 
     error BadLeverage();
@@ -196,9 +215,9 @@ interface IHitOneMarket {
     // constants
     // ============================================================
 
-    function MAKER_POOL()                external view returns (address);
-    function MAKER_POOL_WITHDRAW_DELAY() external view returns (uint256);
-    function HALT_COOLDOWN()             external view returns (uint256);
+    function WITHDRAW_DELAY_MIN() external view returns (uint256);
+    function WITHDRAW_DELAY_MAX() external view returns (uint256);
+    function HALT_COOLDOWN()     external view returns (uint256);
 
     // ============================================================
     // EIP-712 order signed by the user
@@ -210,6 +229,7 @@ interface IHitOneMarket {
     /// `(channel, nonce)` are user-scoped and single-use.
     struct Order {
         address user;            // position holder; signer of this order
+        address maker;           // exact counterparty the user chose; must equal the submitter
         address token;
         bool    isLong;
         bool    isOpen;          // true=open, false=close
@@ -266,27 +286,30 @@ interface IHitOneMarket {
     // ============================================================
 
     function usdm() external view returns (IERC20);
-    function funder() external view returns (address);
-    function halter() external view returns (address);
+    function makerFunder(address maker) external view returns (address);
+    function isHalter(address account) external view returns (bool);
     function pausedNew() external view returns (bool);
     function halted() external view returns (bool);
     function haltedUntil() external view returns (uint64);
+    function withdrawDelay() external view returns (uint256);
+    function roleChangeDelay() external view returns (uint256);
 
-    function isMaker(address account) external view returns (bool);
-
-    function paramsOf(address token) external view returns (ParamCatalog.TokenParams memory);
+    /// @notice Owner-curated token grid (structural). Risk is per-maker (`makerRiskOf`).
+    function structuralOf(address token) external view returns (ParamCatalog.Structural memory);
+    function makerRiskOf(address maker, address token) external view returns (ParamCatalog.Risk memory);
     function oracleOf(address token)
-        external view returns (address feed, uint8 decimals, uint32 maxStale);
+        external view returns (address feed, uint8 decimals, uint32 maxStale, uint16 maxDevBps);
 
-    /// @notice Internal balance for `account`. Only the maker pool holds a balance here — taker
-    /// collateral is pulled from and paid back to wallets directly, so taker rows read 0.
+    /// @notice Segregated pool balance for `account` (a maker). Each maker holds its own pool;
+    /// user collateral is pulled from and paid back to wallets directly, so non-maker rows read 0.
     function collateral(address account, address token) external view returns (uint256);
 
-    function marketOf(address token) external view returns (MarketView memory);
-    function rateRingAt(address token, uint16 idx) external view returns (int64);
+    /// @notice Live state of the `(maker, token)` sub-market.
+    function marketOf(address maker, address token) external view returns (MarketView memory);
+    function rateRingAt(address maker, address token, uint16 idx) external view returns (int64);
 
     function nextPositionId() external view returns (uint256);
-    function activePositionId(address user, address token) external view returns (uint256);
+    function activePositionId(address user, address maker, address token) external view returns (uint256);
 
     function nonceUsed(address user, uint256 channel, uint256 nonce) external view returns (bool);
 
@@ -296,20 +319,35 @@ interface IHitOneMarket {
     // admin
     // ============================================================
 
-    function setMaker(address m, bool allowed) external;
-    function setFunder(address f) external;
-    function setHalter(address h) external;
-    function renounceMaker() external;
+    /// @notice Queue a halter grant/revoke behind `roleChangeDelay()`; `executeRoleChange` applies
+    /// it after the delay, `cancelRoleChange` (owner) drops it. The halter is the only timelocked
+    /// role — makers self-register and self-fund.
+    function queueSetHalter(address h, bool allowed) external returns (uint256 id);
+    function executeRoleChange(uint256 id) external;
+    function cancelRoleChange(uint256 id) external;
+    function pendingRoleChange(uint256 id)
+        external view returns (uint8 kind, address subject, address account, bool allowed, uint64 readyAt, bool exists);
 
-    function setToken(address token, ParamCatalog.TokenParams calldata params) external;
+    /// @notice A maker sets its own funder (treasury) key for its pool. While unset the maker is
+    /// its own funder; once set, only the current funder may rotate it. Pass address(0) to reset.
+    function setMakerFunder(address maker, address funder) external;
+
+    /// @notice Set the maker-pool withdrawal timelock. Clamped to [WITHDRAW_DELAY_MIN,
+    /// WITHDRAW_DELAY_MAX]; also sets `roleChangeDelay` (= 2×). Instant, but the MIN floor
+    /// guarantees a minimum window even under an adversarial owner.
+    function setWithdrawDelay(uint256 d) external;
+
+    /// @notice Owner curates the token-level structural grid. priceTick==0 deregisters.
+    function setToken(address token, ParamCatalog.Structural calldata structural) external;
+    /// @notice A maker sets the risk limits for its OWN book on `token` (permissionless).
     function setRiskLimits(address token, ParamCatalog.Risk calldata risk) external;
-    function setOracle(address token, address feed, uint8 decimals, uint32 maxStale) external;
+    function setOracle(address token, address feed, uint8 decimals, uint32 maxStale, uint16 maxDevBps) external;
 
-    /// @notice Emergency halt. Callable by any maker, the funder, the halter, or the owner.
-    /// Freezes opens, increases, closes, liquidations and mark pushes. Sets a fresh
+    /// @notice Emergency halt. Callable ONLY by a halter (`isHalter`) — not makers, funders, or
+    /// the owner. Freezes opens, increases, closes, liquidations and mark pushes. Sets a fresh
     /// `HALT_COOLDOWN` window; calling again while halted only pushes `haltedUntil` further out.
     function halt() external;
-    /// @notice Lift the halt. Owner or halter only, and only once `haltedUntil` has elapsed.
+    /// @notice Lift the halt. Halter only, and only once `haltedUntil` has elapsed.
     function unhalt() external;
     function setPausedNew(bool paused) external;
 
@@ -317,14 +355,18 @@ interface IHitOneMarket {
     // maker pool
     // ============================================================
 
-    /// @notice Funder supplies maker-pool collateral for `token`, pulling USDM from msg.sender.
-    function fundMakerPool(address token, uint256 amount) external;
+    /// @notice `maker`'s funder supplies collateral to that maker's segregated pool, pulling USDM
+    /// from msg.sender. Callable only by `makerFunder[maker]`.
+    function fundMakerPool(address maker, address token, uint256 amount) external;
 
-    function queueWithdrawMakerPool(address token, uint256 amount, address to) external returns (uint256 id);
+    /// @notice Queue a withdrawal from `maker`'s pool. Callable only by `makerFunder[maker]`.
+    /// Ready after `withdrawDelay`. `cancelWithdrawMakerPool` is likewise funder-gated (not owner).
+    function queueWithdrawMakerPool(address maker, address token, uint256 amount, address to)
+        external returns (uint256 id);
     function executeWithdrawMakerPool(uint256 id) external;
     function cancelWithdrawMakerPool(uint256 id) external;
     function pendingMakerPoolWithdrawal(uint256 id)
-        external view returns (address token, address to, uint256 amount, uint64 readyAt, bool exists);
+        external view returns (address maker, address token, address to, uint256 amount, uint64 readyAt, bool exists);
 
     // ============================================================
     // maker: mark + rate (admin push, no order)
@@ -392,10 +434,4 @@ interface IHitOneMarket {
     /// liquidating at that just-posted mark. Pass `0` to liquidate against the existing mark.
     function liquidate(address token, uint256 newMark, uint256[] calldata positionIds) external;
 
-    // ============================================================
-    // views — ring reconstruction
-    // ============================================================
-
-    function reconstructAt(address token, uint16 entries)
-        external view returns (uint256 markAtK, int128 fundingAtK, uint64 timeAtK);
 }
