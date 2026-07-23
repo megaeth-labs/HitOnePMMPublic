@@ -29,7 +29,7 @@ end-to-end in one file. Storage lives in exactly one place.
 |---|---|
 | `HitOneStorage.sol`   | All storage, constants, immutables, modifiers, tick↔wei helpers. Single source of the storage layout. |
 | `HitOneOrders.sol`    | EIP-712 order digest, signature/nonce verification, slippage-band check. |
-| `HitOneMarks.sol`     | Mark + funding-rate push logic, oracle-band check, HP-timestamp read, mark-domain views (`marketOf`, `reconstructAt`). |
+| `HitOneMarks.sol`     | Mark + funding-rate push logic, oracle-band check, HP-timestamp read, mark-domain views (`marketOf`, `rateRingAt`). |
 | `HitOnePositions.sol` | Position lifecycle: open, increase, close/decrease, expire, settle, liquidate, position views. |
 | `HitOneAdmin.sol`     | Owner/maker/funder/halter admin, timelocked role changes, halt/unhalt, token/oracle config, per-maker pool funding + timelocked withdrawals. |
 | `HitOneMarket.sol`    | Concrete contract; just the constructor + inheritance (`HitOnePositions`, `HitOneAdmin`). |
@@ -150,8 +150,7 @@ Per-maker treasury operations (each callable **only by `makerFunder[maker]`**):
 Each maker pushes marks continuously and funding rates occasionally **to its own
 `(msg.sender, token)` book** — marks, the mark ring, the funding index and the rate are all
 per-maker. One maker's marks never affect another maker's positions (liquidation, funding or
-expiry). Views take a `maker` argument: `marketOf(maker, token)`, `rateRingAt(maker, token, idx)`,
-`reconstructAt(maker, token, entries)`.
+expiry). Views take a `maker` argument: `marketOf(maker, token)` and `rateRingAt(maker, token, idx)`.
 
 - `setMark(token, newMark)` — push a new mark (1e18 USDM-wei) to your book, rate unchanged.
 - `setMarkAndRate(token, newMark, newRate)` — push mark and a new funding rate to your book.
@@ -182,7 +181,8 @@ price-denominated funding model.
 Every push (after the first) records a packed entry into a 200-slot ring
 (`MarkRing`): a 20-bit signed `priceDelta` in **tick units** and a 12-bit `timeDelta` in
 **milliseconds**. A parallel ring stores the funding rate active during each interval. This
-history powers liquidation walk-back (§6) and `reconstructAt`.
+history powers the liquidation walk-back (§6); off-chain consumers can reconstruct historical
+marks/funding from the `MarkPushed` (priceDelta + timeDeltaMs) and `FundingRateChanged` streams.
 
 Operator constraints on pushes:
 - **`MarkSameSlot`**: two pushes in the same HP millisecond revert. Rate-limit accordingly.
@@ -399,7 +399,10 @@ Scripts (`script/hitone/`): `DeployHitOne.s.sol` (owner bring-up + a self-regist
 `SimHitOneTrade.s.sol` (real on-chain open→close round trip — run it twice, it opens then closes),
 and `RedStoneFeeds.sol` (per-chain oracle feed addresses + recommended band values).
 
-**Contract-size note.** `HitOneMarket` runs close to the EIP-170 24 576-byte limit. `foundry.toml`
-strips metadata (`bytecode_hash = "none"`, `cbor_metadata = false`) and `reconstructAt` was dropped
-(reconstruct from the `MarkPushed`/`FundingRateChanged` event stream) to leave margin (~24.1 KB).
-Adding surface area may re-breach the limit.
+**Contract-size note.** `HitOneMarket` runs near the EIP-170 24 576-byte limit (~23.5 KB, ~1 KB
+margin). `foundry.toml` strips metadata (`bytecode_hash = "none"`, `cbor_metadata = false`), and to
+make room several off-chain-derivable views were dropped: `reconstructAt`, and the live `liqPrice`
+/ `fundingOwed` fields of `positions()` (compute them from the returned fields + `marketOf`). We
+measured moving the math/validation into external libraries or a config contract — both made it
+*bigger*, not smaller (delegatecall/plumbing glue > the inlined code). So trimming views is the
+lever; adding surface area may re-breach the limit.

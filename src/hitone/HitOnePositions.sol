@@ -472,10 +472,10 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
 
     // ---- Views ----
 
-    /// @notice Return a position with its live risk. `realizedPnl` is the *effective* PnL (net
-    /// of funding); the gross PnL / funding split is recoverable from the `PositionClosed` event.
-    /// `payoutReceived` is derived: `max(0, col + realizedPnl - makerCutPaid)`. `fundingOwed` and
-    /// `liqPrice` are live (computed at the current mark) and read 0 once the position is closed.
+    /// @notice Return a position's stored fields. `realizedPnl` is the *effective* PnL (net of
+    /// funding); the gross PnL / funding split is recoverable from the `PositionClosed` event.
+    /// `payoutReceived` is derived: `max(0, col + realizedPnl - makerCutPaid)`. Live `fundingOwed`
+    /// / `liqPrice` are not returned — compute them off-chain (see the struct doc in the interface).
     function positions(uint256 id) external view override returns (PositionView memory v) {
         Position storage p = _positions[id];
         ParamCatalog.Structural storage s = _params[p.token].structural;
@@ -501,32 +501,11 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
             closePrice:        _priceOut(p.closePrice, s.priceTick),
             realizedPnl:       effPnl_,
             makerCutPaid:      uint256(p.makerCutPaid),
-            payoutReceived:    payout_,
-            fundingOwed:       _fundingOwed(p, s),
-            liqPrice:          _liqPrice(p, s)
+            payoutReceived:    payout_
         });
     }
-
-    function _fundingOwed(Position storage p, ParamCatalog.Structural storage s) internal view returns (int256) {
-        if (p.user == address(0) || p.closed) return 0;
-        MarkState storage st = _markState[p.maker][p.token];
-        int128 indexNow = _indexNow(st, s.priceTick);
-        int256 delta = int256(indexNow) - int256(p.fundingCheckpoint);
-        if (!p.isLong) delta = -delta;
-        // ÷ SCALE cancels the 1e18 price scale carried by the funding index; result is USDM-wei.
-        return (delta * int256(uint256(p.size) * s.sizeTick)) / int256(ParamCatalog.SCALE);
-    }
-
-    function _liqPrice(Position storage p, ParamCatalog.Structural storage s) internal view returns (uint256) {
-        if (p.user == address(0) || p.closed) return 0;
-        int256 fundingPaid = _fundingOwed(p, s);
-        int256 denom = int256(uint256(p.size)) * int256(s.notionalScale);
-        if (denom == 0) return 0;
-        int256 delta = (int256(uint256(p.col)) + fundingPaid) / denom;
-        int256 thresholdUnits = p.isLong
-            ? int256(uint256(p.entryPrice)) - delta
-            : int256(uint256(p.entryPrice)) + delta;
-        if (thresholdUnits < 0) return 0;
-        return uint256(thresholdUnits) * s.priceTick;
-    }
+    // Live `fundingOwed` / `liqPrice` views were dropped to fit the EIP-170 contract-size limit.
+    // Off-chain, funding owed = (indexNow − fundingCheckpoint) × size × sizeTick / SCALE (sign-flip
+    // for shorts), and liqPrice solves effPnl = −col; both use the maker's live mark/funding index
+    // from `marketOf(maker, token)`, mirroring the on-chain `_isLiquidatable` math.
 }

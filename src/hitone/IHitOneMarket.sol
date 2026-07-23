@@ -256,10 +256,12 @@ interface IHitOneMarket {
         uint256 openInterestShort;  // USDM-wei notional
     }
 
-    /// @notice A position plus its live risk. `realizedPnl` is the *effective* PnL (net of
-    /// funding); the gross PnL / funding split is recoverable from the `PositionClosed` event.
-    /// `payoutReceived` is derived: `max(0, col + realizedPnl - makerCutPaid)`. `fundingOwed`
-    /// and `liqPrice` are computed at the current mark and read 0 once the position is closed.
+    /// @notice A position's stored fields. `realizedPnl` is the *effective* PnL (net of funding);
+    /// the gross PnL / funding split is recoverable from the `PositionClosed` event. `payoutReceived`
+    /// is derived: `max(0, col + realizedPnl - makerCutPaid)`. Live `liqPrice` / `fundingOwed` are
+    /// NOT returned (they were dropped to fit the contract-size limit) — compute them off-chain from
+    /// these fields + the maker's current mark/funding (`marketOf(maker, token)`), mirroring the
+    /// on-chain `_isLiquidatable` math.
     struct PositionView {
         address user;
         address token;
@@ -277,8 +279,6 @@ interface IHitOneMarket {
         int256  realizedPnl;
         uint256 makerCutPaid;
         uint256 payoutReceived;
-        int256  fundingOwed;
-        uint256 liqPrice;
     }
 
     // ============================================================

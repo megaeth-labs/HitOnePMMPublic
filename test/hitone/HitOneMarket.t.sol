@@ -951,11 +951,16 @@ contract HitOneMarketTest is Test {
         assertEq(h.activePositionId(alice, maker, token), id, "still active");
     }
 
-    function test_partialCloseLiqPriceUnchanged() public {
+    function test_partialCloseKeepsRiskProfile() public {
+        // A pro-rata close preserves the liq price: entry + funding checkpoint unchanged, and
+        // col/size scale together. (liqPrice itself is now computed off-chain.)
         uint256 id = _submitOpenLong(alicePk, 1e18, 50_000e18, 50_000e18, 0);
-        uint256 liqBefore = h.positions(id).liqPrice;
+        IHitOneMarket.PositionView memory a = h.positions(id);
         _submitCloseLong(alicePk, 5e17, 50_000e18, 50_000e18, 1);
-        assertEq(h.positions(id).liqPrice, liqBefore, "pro-rata close preserves liq price");
+        IHitOneMarket.PositionView memory b = h.positions(id);
+        assertEq(b.entryPrice, a.entryPrice, "entry unchanged");
+        assertEq(b.fundingCheckpoint, a.fundingCheckpoint, "funding checkpoint unchanged");
+        assertEq(a.col * b.size, b.col * a.size, "col/size ratio (hence liq price) preserved");
     }
 
     function test_partialThenFullClose() public {
