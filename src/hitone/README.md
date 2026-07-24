@@ -309,14 +309,15 @@ Tuning notes:
 - **maxLeverage** is the main knob on how much adverse-move risk the maker pool absorbs per unit
   of collateral — treat it as a risk-budget decision, not a UX one.
 
-`Risk` (per-`(maker, token)`, maker-set, frequent; zero → sensible default, but note a wholly
-unset risk struct leaves `maxPositionNotional == 0` and blocks opens — set it before quoting):
+`MakerRisk` (per-`(maker, token)`, maker-set, instant; zero → sensible default, but note a wholly
+unset risk struct leaves `maxPositionNotional == 0` and blocks opens — set it before quoting).
+HitOne has its **own** risk struct (not the shared `ParamCatalog.Risk`, which also carries
+IsoMarket's `maxDevBps`; HitOne's band is owner-set in the oracle config, so it isn't here):
 - `openFeeBps` (`<= 1000`), `maxPositionNotional` (0 → 200 000e18),
   `maxOIGross` / `maxOISkew` (0 → unlimited).
-- `linearScale` / `quadScale` are IsoMarket slippage knobs — **unused by HitOne** (fills come
-  from the maker + slippage band), pass `type(uint256).max`.
-- `maxDevBps` in this struct is **unused by HitOne** — the oracle band lives in the owner's oracle
-  config (below), not per-maker, so a maker can't loosen it.
+- `linearScale` / `quadScale` are the `Slippage` size-impact knobs — **reserved, not yet applied
+  by HitOne** (`type(uint256).max` = off). When wired, the size-based fill impact folds into the
+  same signed-slippage check as the open fee, so the all-in cost stays inside the user's band.
 
 ### Oracle band (owner-set per token — the context makers operate within)
 

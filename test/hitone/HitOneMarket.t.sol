@@ -49,11 +49,10 @@ contract HitOneMarketTest is Test {
             cutIntercept: 0, cutSlopeBps: 550, maxCutBps: 550
         });
     }
-    function _defaultRisk() internal pure returns (ParamCatalog.Risk memory) {
-        return ParamCatalog.Risk({
+    function _defaultRisk() internal pure returns (IHitOneMarket.MakerRisk memory) {
+        return IHitOneMarket.MakerRisk({
             openFeeBps: 0, linearScale: type(uint256).max, quadScale: type(uint256).max,
-            maxPositionNotional: 0,
-            maxOIGross: 0, maxOISkew: 0, maxDevBps: 0
+            maxPositionNotional: 0, maxOIGross: 0, maxOISkew: 0
         });
     }
 
@@ -311,7 +310,7 @@ contract HitOneMarketTest is Test {
     /// @notice The open fee is folded into the user's signed worst-price band: a maker can't
     /// extract more fee than the user consented to via slippage.
     function test_openFeeBoundedBySignedSlippage() public {
-        ParamCatalog.Risk memory r = h.makerRiskOf(maker, token);
+        IHitOneMarket.MakerRisk memory r = h.makerRiskOf(maker, token);
         r.openFeeBps = 50;                                   // 0.5% open fee
         vm.prank(maker);
         h.setRiskLimits(token, r);
@@ -1097,7 +1096,7 @@ contract HitOneMarketTest is Test {
 
     function test_increaseChargesFeeOnlyOnAddedSize() public {
         // openFeeBps = 50 (0.5%)
-        ParamCatalog.Risk memory r = h.makerRiskOf(maker, token);
+        IHitOneMarket.MakerRisk memory r = h.makerRiskOf(maker, token);
         r.openFeeBps = 50;
         vm.prank(maker);
         h.setRiskLimits(token, r);

@@ -28,7 +28,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     function _openPosition(Order calldata order, uint256 fillPrice_1e18) internal returns (uint256 id) {
         ParamCatalog.Structural storage s = _params[order.token].structural;
         if (s.priceTick == 0) revert UnknownToken();
-        ParamCatalog.Risk storage risk = _makerRisk[order.maker][order.token];
+        MakerRisk storage risk = _makerRisk[order.maker][order.token];
         if (order.size == 0 || order.leverage == 0) revert BadSize();
         if (activePositionId[order.user][order.maker][order.token] != 0) revert PositionExists();
         // All-in slippage: the open fee must fit inside the user's signed worst-price band.
@@ -114,7 +114,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     function _increasePosition(Order calldata order, uint256 fillPrice_1e18) internal returns (uint256 id) {
         ParamCatalog.Structural storage s = _params[order.token].structural;
         if (s.priceTick == 0) revert UnknownToken();
-        ParamCatalog.Risk storage risk = _makerRisk[order.maker][order.token];
+        MakerRisk storage risk = _makerRisk[order.maker][order.token];
         if (order.size == 0 || order.leverage == 0) revert BadSize();
         // All-in slippage: the added-size open fee must fit inside the user's signed band.
         _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, risk.openFeeBps);

@@ -104,15 +104,15 @@ abstract contract HitOneAdmin is HitOneStorage {
     /// @notice A maker sets the risk limits for its OWN book on `token`. Permissionless — anyone
     /// may run a maker book on an owner-registered token; a maker's book is inert until this is set
     /// (default caps leave `maxPositionNotional` at 0, which blocks opens).
-    function setRiskLimits(address token, ParamCatalog.Risk calldata riskIn) external override {
+    function setRiskLimits(address token, MakerRisk calldata riskIn) external override {
         if (_params[token].structural.priceTick == 0) revert UnknownToken();
-        ParamCatalog.Risk memory risk = riskIn;
+        MakerRisk memory risk = riskIn;
         if (risk.maxPositionNotional == 0) risk.maxPositionNotional = DEFAULT_MAX_POSITION_NOTIONAL;
         if (risk.maxOIGross == 0)          risk.maxOIGross          = type(uint256).max;
         if (risk.maxOISkew == 0)           risk.maxOISkew           = type(uint256).max;
         if (risk.linearScale == 0)         risk.linearScale         = type(uint256).max;
         if (risk.quadScale == 0)           risk.quadScale           = type(uint256).max;
-        ParamCatalog.validateRisk(risk);
+        if (risk.openFeeBps > ParamCatalog.MAX_FEE_BPS) revert BadFee();
         _makerRisk[msg.sender][token] = risk;
         emit RiskLimitsSet(msg.sender, token, risk);
     }
@@ -202,7 +202,7 @@ abstract contract HitOneAdmin is HitOneStorage {
     function structuralOf(address token) external view override returns (ParamCatalog.Structural memory) {
         return _params[token].structural;
     }
-    function makerRiskOf(address maker, address token) external view override returns (ParamCatalog.Risk memory) {
+    function makerRiskOf(address maker, address token) external view override returns (MakerRisk memory) {
         return _makerRisk[maker][token];
     }
     function oracleOf(address token)

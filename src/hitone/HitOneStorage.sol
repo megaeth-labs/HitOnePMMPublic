@@ -73,7 +73,7 @@ abstract contract HitOneStorage is
     /// duration, house cut. Only `.structural` is used; risk is per-maker (`_makerRisk`).
     mapping(address => ParamCatalog.TokenParams) internal _params;
     /// @notice Per-(maker, token) risk limits, set by the maker. A maker's book is inert until set.
-    mapping(address => mapping(address => ParamCatalog.Risk)) internal _makerRisk;
+    mapping(address => mapping(address => MakerRisk)) internal _makerRisk;
 
     /// @notice Owner-set per-token oracle band — part of the "context" makers operate within, so
     /// the deviation bound (`maxDevBps`) lives here, NOT in per-maker risk. `feed == 0` disables it.

@@ -62,7 +62,7 @@ interface IHitOneMarket {
     event Unhalted(address indexed by);
 
     event TokenSet(address indexed token, ParamCatalog.Structural structural);
-    event RiskLimitsSet(address indexed maker, address indexed token, ParamCatalog.Risk risk);
+    event RiskLimitsSet(address indexed maker, address indexed token, MakerRisk risk);
     event OracleSet(address indexed token, address feed, uint8 decimals, uint32 maxStale, uint16 maxDevBps);
 
     event MakerPoolFunded(address indexed maker, address indexed from, address indexed token, uint256 amount);
@@ -175,6 +175,7 @@ interface IHitOneMarket {
     error ZeroAddress();
 
     error BadLeverage();
+    error BadFee();
     error BadSize();
     error BadMark();
 
@@ -245,6 +246,20 @@ interface IHitOneMarket {
         uint256 nonce;           // monotonic within (user, channel) is recommended
     }
 
+    /// @notice Per-`(maker, token)` risk limits, set by the maker (permissionless, instant). This is
+    /// HitOne's own risk type — the shared `ParamCatalog.Risk` also carries a `maxDevBps` (IsoMarket's
+    /// maker-set oracle band), which HitOne does NOT use: its band is owner-set in the oracle config.
+    /// `linearScale`/`quadScale` are the `Slippage` size-impact knobs — reserved (not yet applied by
+    /// HitOne); `type(uint256).max` disables a term. Zero fields resolve to sensible defaults.
+    struct MakerRisk {
+        uint256 openFeeBps;          // open fee, bps of notional (<= 1000); folded into the slippage band
+        uint256 maxPositionNotional; // 0 -> 200_000e18
+        uint256 maxOIGross;          // 0 -> unlimited
+        uint256 maxOISkew;           // 0 -> unlimited
+        uint256 linearScale;         // 0 -> off (type(uint256).max)
+        uint256 quadScale;           // 0 -> off (type(uint256).max)
+    }
+
     // ============================================================
     // view structs
     // ============================================================
@@ -300,7 +315,7 @@ interface IHitOneMarket {
 
     /// @notice Owner-curated token grid (structural). Risk is per-maker (`makerRiskOf`).
     function structuralOf(address token) external view returns (ParamCatalog.Structural memory);
-    function makerRiskOf(address maker, address token) external view returns (ParamCatalog.Risk memory);
+    function makerRiskOf(address maker, address token) external view returns (MakerRisk memory);
     function oracleOf(address token)
         external view returns (address feed, uint8 decimals, uint32 maxStale, uint16 maxDevBps);
 
@@ -354,7 +369,7 @@ interface IHitOneMarket {
     function applyOracle(address token, address feed, uint8 decimals, uint32 maxStale, uint16 maxDevBps) external;
 
     /// @notice A maker sets the risk limits for its OWN book on `token` (permissionless, instant).
-    function setRiskLimits(address token, ParamCatalog.Risk calldata risk) external;
+    function setRiskLimits(address token, MakerRisk calldata risk) external;
 
     /// @notice Emergency halt. Callable ONLY by a halter (`isHalter`) — not makers, funders, or
     /// the owner. Freezes opens, increases, closes, liquidations and mark pushes. Sets a fresh
