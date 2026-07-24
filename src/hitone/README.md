@@ -313,11 +313,15 @@ Tuning notes:
 unset risk struct leaves `maxPositionNotional == 0` and blocks opens — set it before quoting).
 HitOne has its **own** risk struct (not the shared `ParamCatalog.Risk`, which also carries
 IsoMarket's `maxDevBps`; HitOne's band is owner-set in the oracle config, so it isn't here):
-- `openFeeBps` (`<= 1000`), `maxPositionNotional` (0 → 200 000e18),
+- `openFeeBps` (`<= 1000`) — the flat base open fee; `maxPositionNotional` (0 → 200 000e18),
   `maxOIGross` / `maxOISkew` (0 → unlimited).
-- `linearScale` / `quadScale` are the `Slippage` size-impact knobs — **reserved, not yet applied
-  by HitOne** (`type(uint256).max` = off). When wired, the size-based fill impact folds into the
-  same signed-slippage check as the open fee, so the all-in cost stays inside the user's band.
+- `linearScale` / `quadScale` — **size-scaled open fee** on top of the flat `openFeeBps`. With
+  `N = notional / usdmDenom` (whole USDM), the total open-fee rate is
+  `openFeeBps + linearScale·N/1e6 + quadScale·N²/1e12` bps. Both read as **"extra bps at $1M
+  notional"** — at $1M the linear term = `linearScale` bps and the quad term = `quadScale` bps; the
+  linear term grows ∝ N, the quad term ∝ N² (whales pay super-linearly). `0` = off (no default).
+  The total fee folds into the user's signed slippage band (same as `openFeeBps`), so a bigger fee
+  just means the open reverts `SlippageExceeded` / `Insolvent` — self-limiting, no hard cap.
 
 ### Oracle band (owner-set per token — the context makers operate within)
 

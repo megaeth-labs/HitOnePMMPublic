@@ -51,8 +51,8 @@ contract HitOneMarketTest is Test {
     }
     function _defaultRisk() internal pure returns (IHitOneMarket.MakerRisk memory) {
         return IHitOneMarket.MakerRisk({
-            openFeeBps: 0, linearScale: type(uint256).max, quadScale: type(uint256).max,
-            maxPositionNotional: 0, maxOIGross: 0, maxOISkew: 0
+            openFeeBps: 0, maxPositionNotional: 0, maxOIGross: 0, maxOISkew: 0,
+            linearScale: 0, quadScale: 0                 // size fee off
         });
     }
 
@@ -327,6 +327,26 @@ contract HitOneMarketTest is Test {
         vm.prank(maker);
         uint256 id = h.openPosition(wide, 50_000e18, _sign(bobPk, wide));
         assertEq(h.positions(id).user, bob);
+    }
+
+    /// @notice Size-scaled open fee: `openFeeBps + linearScale·N/1e6 + quadScale·N²/1e12`, N in
+    /// whole USDM, linear/quad = "bps at $1M". At $1M: linear = linearScale, quad = quadScale.
+    function test_sizeFeeLinearAndQuad() public {
+        IHitOneMarket.MakerRisk memory r = h.makerRiskOf(maker, token);
+        r.linearScale         = 10;             // +10 bps at $1M (∝ N)
+        r.quadScale           = 5;              // +5 bps at $1M (∝ N²)
+        r.maxPositionNotional = 10_000_000e18;  // allow a $1M position
+        vm.prank(maker);
+        h.setRiskLimits(token, r);
+
+        uint256 poolBefore = h.collateral(maker, token);
+
+        // $1M notional (20 BTC @ $50k, N = 1e6): linear 10 + quad 5 = 15 bps -> fee 1500 USDM.
+        _adv(1);
+        IHitOneMarket.Order memory o = _openOrder(bob, true, 20e18, 100, 50_000e18, 100, 0);
+        vm.prank(maker);
+        h.openPosition(o, 50_000e18, _sign(bobPk, o));
+        assertEq(h.collateral(maker, token) - poolBefore, 1500e18, "15 bps size fee at $1M");
     }
 
     function test_openRejectsSecondActiveForSameUserToken() public {

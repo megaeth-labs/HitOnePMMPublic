@@ -107,6 +107,25 @@ library ParamCatalog {
         return effPnl * rateBps / BPS_DENOM;
     }
 
+    /// @notice HitOne size-scaled open-fee rate (bps). `N = notional / usdmDenom` (whole USDM):
+    ///   bps = openFeeBps + linearScale·N / 1e6 + quadScale·N² / 1e12
+    /// `linearScale`/`quadScale` read as "extra bps at $1M notional" (linear ∝ N, quad ∝ N²);
+    /// `0` disables a term. Checked arithmetic reverts on absurd configs (too-large scales).
+    uint256 internal constant SIZE_FEE_LINEAR_REF = 1e6;   // $1M in whole USDM
+    uint256 internal constant SIZE_FEE_QUAD_REF   = 1e12;  // ($1M)²
+    function sizeFeeBps(
+        uint256 notional,
+        uint256 usdmDenom,
+        uint256 openFeeBps,
+        uint256 linearScale,
+        uint256 quadScale
+    ) internal pure returns (uint256 bps) {
+        uint256 n = notional / usdmDenom;
+        bps = openFeeBps;
+        if (linearScale != 0) bps += linearScale * n / SIZE_FEE_LINEAR_REF;
+        if (quadScale   != 0) bps += quadScale * n * n / SIZE_FEE_QUAD_REF;
+    }
+
     /// @notice Validate `risk`. `linearScale` and `quadScale` are interpreted in sizeUnits.
     function validateRisk(Risk memory p) internal pure {
         if (p.openFeeBps > MAX_FEE_BPS)                                      revert BadFee();

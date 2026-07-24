@@ -31,13 +31,16 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         MakerRisk storage risk = _makerRisk[order.maker][order.token];
         if (order.size == 0 || order.leverage == 0) revert BadSize();
         if (activePositionId[order.user][order.maker][order.token] != 0) revert PositionExists();
-        // All-in slippage: the open fee must fit inside the user's signed worst-price band.
-        _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, risk.openFeeBps);
 
         uint128 fillPriceUnits = _toPriceUnits(fillPrice_1e18, s.priceTick);
         uint128 sizeUnits      = _toSizeUnits(order.size, s.sizeTick);
+        uint256 markNotional   = _notional(fillPriceUnits, sizeUnits, s.notionalScale);
 
-        uint256 markNotional = _notional(fillPriceUnits, sizeUnits, s.notionalScale);
+        // Size-scaled open fee (base + linear + quad in notional), folded into the signed band so
+        // the all-in cost — fee included — stays within the user's worst price.
+        uint256 feeBps = ParamCatalog.sizeFeeBps(markNotional, _usdmDenom, risk.openFeeBps, risk.linearScale, risk.quadScale);
+        _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, feeBps);
+
         uint256 collateral_  = markNotional / order.leverage;
         if (collateral_ == 0) revert BadSize();
 
@@ -55,7 +58,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
             if (skew  > risk.maxOISkew)  revert OISkewCap();
         }
 
-        uint256 fee = (markNotional * risk.openFeeBps) / ParamCatalog.BPS_DENOM;
+        uint256 fee = (markNotional * feeBps) / ParamCatalog.BPS_DENOM;
         uint256 collAfterFee = collateral_;
         if (fee > 0) {
             if (collAfterFee <= fee) revert Insolvent();
@@ -116,8 +119,6 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         if (s.priceTick == 0) revert UnknownToken();
         MakerRisk storage risk = _makerRisk[order.maker][order.token];
         if (order.size == 0 || order.leverage == 0) revert BadSize();
-        // All-in slippage: the added-size open fee must fit inside the user's signed band.
-        _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, risk.openFeeBps);
 
         id = activePositionId[order.user][order.maker][order.token];
         if (id == 0) revert NoPosition();
@@ -134,6 +135,10 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         uint256 addCollateral = addNotional / order.leverage;
         if (addCollateral == 0) revert BadSize();
 
+        // Size-scaled open fee on the ADDED notional, folded into the user's signed band.
+        uint256 feeBps = ParamCatalog.sizeFeeBps(addNotional, _usdmDenom, risk.openFeeBps, risk.linearScale, risk.quadScale);
+        _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, feeBps);
+
         uint256 totalNotional = uint256(p.notionalAtOpen) + addNotional;
         if (totalNotional > risk.maxPositionNotional) revert PositionNotionalCap();
 
@@ -148,7 +153,7 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         }
 
         // open fee charged only on the added size
-        uint256 fee = (addNotional * risk.openFeeBps) / ParamCatalog.BPS_DENOM;
+        uint256 fee = (addNotional * feeBps) / ParamCatalog.BPS_DENOM;
         uint256 addColAfterFee = addCollateral;
         if (fee > 0) {
             if (addColAfterFee <= fee) revert Insolvent();
