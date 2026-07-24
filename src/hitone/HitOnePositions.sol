@@ -22,7 +22,6 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     {
         if (!order.isOpen) revert BadUserSig();
         _verifyAndConsumeOrder(order, userSig);
-        _checkSlippageBand(fillPrice, order.targetPrice, order.maxSlippageBps);
         id = _openPosition(order, fillPrice);
     }
 
@@ -32,6 +31,8 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         ParamCatalog.Risk storage risk = _makerRisk[order.maker][order.token];
         if (order.size == 0 || order.leverage == 0) revert BadSize();
         if (activePositionId[order.user][order.maker][order.token] != 0) revert PositionExists();
+        // All-in slippage: the open fee must fit inside the user's signed worst-price band.
+        _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, risk.openFeeBps);
 
         uint128 fillPriceUnits = _toPriceUnits(fillPrice_1e18, s.priceTick);
         uint128 sizeUnits      = _toSizeUnits(order.size, s.sizeTick);
@@ -107,7 +108,6 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
     {
         if (!order.isOpen) revert BadUserSig();
         _verifyAndConsumeOrder(order, userSig);
-        _checkSlippageBand(fillPrice, order.targetPrice, order.maxSlippageBps);
         id = _increasePosition(order, fillPrice);
     }
 
@@ -116,6 +116,8 @@ abstract contract HitOnePositions is HitOneMarks, HitOneOrders {
         if (s.priceTick == 0) revert UnknownToken();
         ParamCatalog.Risk storage risk = _makerRisk[order.maker][order.token];
         if (order.size == 0 || order.leverage == 0) revert BadSize();
+        // All-in slippage: the added-size open fee must fit inside the user's signed band.
+        _checkSlippageBandWithFee(fillPrice_1e18, order.targetPrice, order.maxSlippageBps, order.isLong, risk.openFeeBps);
 
         id = activePositionId[order.user][order.maker][order.token];
         if (id == 0) revert NoPosition();

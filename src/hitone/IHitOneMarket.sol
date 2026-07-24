@@ -45,6 +45,7 @@ interface IHitOneMarket {
 
     event MakerFunderSet(address indexed maker, address indexed funder);
     event HalterSet(address indexed halter, bool allowed);
+    event ConfiguratorSet(address indexed configurator);
     event WithdrawDelaySet(uint256 delay);
 
     /// @notice Halter role change queued behind `roleChangeDelay()`. `kind` is always 2 (halter);
@@ -161,6 +162,8 @@ interface IHitOneMarket {
 
     error NotFunder();
     error WrongMaker();
+    error NotConfigurator();
+    error ConfiguratorAlreadySet();
     error NotHalter();
     error NotPausedNewAuth();
     error MarketHalted();
@@ -288,6 +291,7 @@ interface IHitOneMarket {
     function usdm() external view returns (IERC20);
     function makerFunder(address maker) external view returns (address);
     function isHalter(address account) external view returns (bool);
+    function configurator() external view returns (address);
     function pausedNew() external view returns (bool);
     function halted() external view returns (bool);
     function haltedUntil() external view returns (uint64);
@@ -328,6 +332,12 @@ interface IHitOneMarket {
     function pendingRoleChange(uint256 id)
         external view returns (uint8 kind, address subject, address account, bool allowed, uint64 readyAt, bool exists);
 
+    /// @notice The `HitOneConfig` contract authorized to write owner params via `apply*`. Bootstrap
+    /// once with `setConfigurator` (instant while unset); swap via `queueSetConfigurator` (timelocked,
+    /// executed through `executeRoleChange`).
+    function setConfigurator(address c) external;
+    function queueSetConfigurator(address c) external returns (uint256 id);
+
     /// @notice A maker sets its own funder (treasury) key for its pool. While unset the maker is
     /// its own funder; once set, only the current funder may rotate it. Pass address(0) to reset.
     function setMakerFunder(address maker, address funder) external;
@@ -337,11 +347,14 @@ interface IHitOneMarket {
     /// guarantees a minimum window even under an adversarial owner.
     function setWithdrawDelay(uint256 d) external;
 
-    /// @notice Owner curates the token-level structural grid. priceTick==0 deregisters.
-    function setToken(address token, ParamCatalog.Structural calldata structural) external;
-    /// @notice A maker sets the risk limits for its OWN book on `token` (permissionless).
+    // ---- Owner param writes (configurator only; validation + timelock in HitOneConfig) ----
+    /// @notice Write validated structural params. `priceTick == 0` deregisters.
+    function applyStructural(address token, ParamCatalog.Structural calldata structural) external;
+    /// @notice Write the validated oracle band (`feed == 0` disables it).
+    function applyOracle(address token, address feed, uint8 decimals, uint32 maxStale, uint16 maxDevBps) external;
+
+    /// @notice A maker sets the risk limits for its OWN book on `token` (permissionless, instant).
     function setRiskLimits(address token, ParamCatalog.Risk calldata risk) external;
-    function setOracle(address token, address feed, uint8 decimals, uint32 maxStale, uint16 maxDevBps) external;
 
     /// @notice Emergency halt. Callable ONLY by a halter (`isHalter`) — not makers, funders, or
     /// the owner. Freezes opens, increases, closes, liquidations and mark pushes. Sets a fresh

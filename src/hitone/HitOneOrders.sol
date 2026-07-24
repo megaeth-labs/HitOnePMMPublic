@@ -37,4 +37,17 @@ abstract contract HitOneOrders is HitOneStorage {
         uint256 diff = fillPrice > targetPrice ? fillPrice - targetPrice : targetPrice - fillPrice;
         if (diff * ParamCatalog.BPS_DENOM > targetPrice * maxSlippageBps) revert SlippageExceeded();
     }
+
+    /// @dev Open/increase band check with the open fee folded in. The fee (bps of notional) worsens
+    /// the effective entry by `fillPrice × openFeeBps/1e4` — higher for a long, lower for a short —
+    /// so the ALL-IN price must still sit inside the user's signed band. This bounds any maker fee
+    /// by the user's own worst-price tolerance (the maker can't extract more than the user consented
+    /// to), without a separate fee cap or an Order-struct change.
+    function _checkSlippageBandWithFee(
+        uint256 fillPrice, uint256 targetPrice, uint256 maxSlippageBps, bool isLong, uint256 openFeeBps
+    ) internal pure {
+        uint256 feeImpact = fillPrice * openFeeBps / ParamCatalog.BPS_DENOM;
+        uint256 effective = isLong ? fillPrice + feeImpact : fillPrice - feeImpact;
+        _checkSlippageBand(effective, targetPrice, maxSlippageBps);
+    }
 }

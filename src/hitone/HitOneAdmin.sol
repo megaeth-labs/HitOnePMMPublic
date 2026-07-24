@@ -25,6 +25,19 @@ abstract contract HitOneAdmin is HitOneStorage {
         id = _queueRole(2, address(0), h, allowed);
     }
 
+    /// @notice Bootstrap the configurator — instant while unset (deploy-time wiring). Swapping it
+    /// afterwards is timelocked (`queueSetConfigurator`). A config contract can only grief params.
+    function setConfigurator(address c) external override onlyOwner {
+        if (configurator != address(0)) revert ConfiguratorAlreadySet();
+        if (c == address(0)) revert ZeroAddress();
+        configurator = c;
+        emit ConfiguratorSet(c);
+    }
+    function queueSetConfigurator(address c) external override onlyOwner returns (uint256 id) {
+        if (c == address(0)) revert ZeroAddress();
+        id = _queueRole(3, address(0), c, false);
+    }
+
     function _queueRole(uint8 kind, address subject, address account, bool allowed) internal returns (uint256 id) {
         id = ++_nextRoleChangeId;
         uint64 readyAt = uint64(block.timestamp + roleChangeDelay());
@@ -41,9 +54,9 @@ abstract contract HitOneAdmin is HitOneStorage {
         if (!r.exists)                   revert RoleChangeUnknown();
         if (block.timestamp < r.readyAt) revert RoleChangeNotReady();
         delete _pendingRoles[id];
-        // Only the halter role is owner-timelocked; makers self-register and self-fund.
-        isHalter[r.account] = r.allowed;
-        emit HalterSet(r.account, r.allowed);
+        // kind 3 = configurator swap; else halter grant/revoke. (Makers self-register + self-fund.)
+        if (r.kind == 3) { configurator = r.account; emit ConfiguratorSet(r.account); }
+        else             { isHalter[r.account] = r.allowed; emit HalterSet(r.account, r.allowed); }
         emit RoleChangeExecuted(id);
     }
     function cancelRoleChange(uint256 id) external override onlyOwner {
@@ -73,21 +86,19 @@ abstract contract HitOneAdmin is HitOneStorage {
         emit WithdrawDelaySet(d);
     }
 
-    /// @notice Owner curates the token universe: only the token-level structural grid (ticks,
-    /// leverage bounds, duration, house cut). Risk is per-maker (`setRiskLimits`). priceTick==0
-    /// deregisters the token.
-    function setToken(address token, ParamCatalog.Structural calldata structural) external override onlyOwner {
-        if (token == address(0)) revert ZeroAddress();
+    /// @notice Write validated structural params for `token` (configurator only). `priceTick == 0`
+    /// deregisters. Validation + the owner-param timelock live in `HitOneConfig`.
+    function applyStructural(address token, ParamCatalog.Structural calldata structural)
+        external override onlyConfigurator
+    {
         if (structural.priceTick == 0) {
             delete _params[token];
             ParamCatalog.Structural memory empty;
             emit TokenSet(token, empty);
-            return;
+        } else {
+            _params[token].structural = structural;
+            emit TokenSet(token, structural);
         }
-        ParamCatalog.Structural memory s = structural;
-        ParamCatalog.validateAndDeriveStructural(s, _usdmDenom);
-        _params[token].structural = s;
-        emit TokenSet(token, s);
     }
 
     /// @notice A maker sets the risk limits for its OWN book on `token`. Permissionless — anyone
@@ -106,17 +117,10 @@ abstract contract HitOneAdmin is HitOneStorage {
         emit RiskLimitsSet(msg.sender, token, risk);
     }
 
-    /// @notice Owner sets the per-token oracle band (the context makers operate within). Optional:
-    /// `feed == 0` disables it. When set, `decimals <= 18`, `maxStale > 0`, and `maxDevBps` in
-    /// (0, BPS_DENOM]. See `RedStoneFeeds` for MegaETH addresses and recommended values (100 bps /
-    /// 6h maxStale to match the RedStone push heartbeat).
-    function setOracle(address token, address feed, uint8 decimals_, uint32 maxStale, uint16 maxDevBps)
-        external override onlyOwner
+    /// @notice Write the validated oracle band for `token` (configurator only; `feed == 0` disables).
+    function applyOracle(address token, address feed, uint8 decimals_, uint32 maxStale, uint16 maxDevBps)
+        external override onlyConfigurator
     {
-        if (_params[token].structural.priceTick == 0) revert UnknownToken();
-        if (feed != address(0) &&
-            (decimals_ > 18 || maxStale == 0 || maxDevBps == 0 || maxDevBps > ParamCatalog.BPS_DENOM))
-            revert BadOracleConfig();
         _oracleConfig[token] = OracleConfig({ feed: feed, decimals: decimals_, maxStale: maxStale, maxDevBps: maxDevBps });
         emit OracleSet(token, feed, decimals_, maxStale, maxDevBps);
     }

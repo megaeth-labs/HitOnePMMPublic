@@ -6,6 +6,7 @@ import { Vm }            from "forge-std/Vm.sol";
 import { Ownable }       from "@openzeppelin/contracts/access/Ownable.sol";
 
 import { HitOneMarket }  from "../../src/hitone/HitOneMarket.sol";
+import { HitOneConfig }  from "../../src/hitone/HitOneConfig.sol";
 import { IHitOneMarket } from "../../src/hitone/IHitOneMarket.sol";
 import { ParamCatalog }  from "../../src/common/ParamCatalog.sol";
 import { MockERC20 }     from "../mocks/MockERC20.sol";
@@ -14,6 +15,7 @@ import { MockAggregatorV3 } from "../mocks/MockAggregatorV3.sol";
 
 contract HitOneMarketTest is Test {
     HitOneMarket internal h;
+    HitOneConfig internal config;
     MockERC20    internal usdm;
 
     address internal owner  = address(this);
@@ -81,9 +83,13 @@ contract HitOneMarketTest is Test {
         usdm = new MockERC20();
         h = new HitOneMarket(owner, address(usdm));
 
-        // Owner curates the token (structural grid only).
+        // Owner param writes (setToken/setOracle) route through the timelocked configurator.
+        config = new HitOneConfig(address(h));
+        h.setConfigurator(address(config));
+
+        // Owner curates the token (structural grid only). First registration is instant.
         token = makeAddr("btc");
-        h.setToken(token, _structural());
+        config.setToken(token, _structural());
 
         // The halter is the only timelocked role.
         uint256 rh = h.queueSetHalter(halter, true);
@@ -300,6 +306,28 @@ contract HitOneMarketTest is Test {
         // 50_500 is 1% of 50_000 — exactly at the boundary, should pass.
         h.openPosition(o, 50_500e18, sig);
         assertGt(h.activePositionId(alice, maker, token), 0);
+    }
+
+    /// @notice The open fee is folded into the user's signed worst-price band: a maker can't
+    /// extract more fee than the user consented to via slippage.
+    function test_openFeeBoundedBySignedSlippage() public {
+        ParamCatalog.Risk memory r = h.makerRiskOf(maker, token);
+        r.openFeeBps = 50;                                   // 0.5% open fee
+        vm.prank(maker);
+        h.setRiskLimits(token, r);
+
+        // At-par fill, but the 0.5% fee alone blows a 0.3% band.
+        _adv(1);
+        IHitOneMarket.Order memory tight = _openOrder(bob, true, 1e18, 100, 50_000e18, 30, 0);
+        vm.prank(maker);
+        vm.expectRevert(IHitOneMarket.SlippageExceeded.selector);
+        h.openPosition(tight, 50_000e18, _sign(bobPk, tight));
+
+        // A user consenting to a 1% band is filled (0.5% fee < 1%).
+        IHitOneMarket.Order memory wide = _openOrder(bob, true, 1e18, 100, 50_000e18, 100, 1);
+        vm.prank(maker);
+        uint256 id = h.openPosition(wide, 50_000e18, _sign(bobPk, wide));
+        assertEq(h.positions(id).user, bob);
     }
 
     function test_openRejectsSecondActiveForSameUserToken() public {
@@ -682,6 +710,70 @@ contract HitOneMarketTest is Test {
     }
 
     // ============================================================
+    // Owner-param config timelock (setToken / setOracle via HitOneConfig)
+    // ============================================================
+
+    function test_configFirstRegistrationInstantThenTimelocked() public {
+        // A brand-new token registers instantly.
+        address tok2 = makeAddr("eth");
+        config.setToken(tok2, _structural());
+        assertGt(h.structuralOf(tok2).priceTick, 0, "first registration instant");
+
+        // A CHANGE to an existing token is timelocked.
+        ParamCatalog.Structural memory s = _structural();
+        s.maxLeverage = 800;
+        config.setToken(tok2, s);
+        uint256 id = config.nextConfigChangeId();
+        assertEq(h.structuralOf(tok2).maxLeverage, 1000, "not applied before delay");
+        vm.expectRevert(HitOneConfig.ConfigChangeNotReady.selector);
+        config.executeConfigChange(id);
+        vm.warp(block.timestamp + h.roleChangeDelay() + 1);
+        config.executeConfigChange(id);
+        assertEq(h.structuralOf(tok2).maxLeverage, 800, "applied after delay");
+    }
+
+    function test_configOwnerCanCancel() public {
+        ParamCatalog.Structural memory s = _structural();
+        s.maxLeverage = 800;
+        config.setToken(token, s);                     // token already registered -> queued
+        uint256 id = config.nextConfigChangeId();
+        config.cancelConfigChange(id);
+        vm.warp(block.timestamp + h.roleChangeDelay() + 1);
+        vm.expectRevert(HitOneConfig.ConfigChangeUnknown.selector);
+        config.executeConfigChange(id);
+    }
+
+    function test_configOnlyMarketOwner() public {
+        vm.prank(alice);
+        vm.expectRevert(HitOneConfig.NotOwner.selector);
+        config.setToken(token, _structural());
+    }
+
+    function test_applyOnlyConfigurator() public {
+        // Even the owner can't write params directly on the market — only the configurator.
+        vm.expectRevert(IHitOneMarket.NotConfigurator.selector);
+        h.applyStructural(token, _structural());
+    }
+
+    function test_oracleFirstSetInstantThenTimelocked() public {
+        MockAggregatorV3 feed = new MockAggregatorV3(8, 50_000e8, block.timestamp);
+        config.setOracle(token, address(feed), 8, 6 hours, 100);   // first set, instant
+        (address f, , , uint16 dev) = h.oracleOf(token);
+        assertEq(f, address(feed));
+        assertEq(dev, 100);
+
+        // A change to the band is timelocked.
+        config.setOracle(token, address(feed), 8, 6 hours, 200);
+        uint256 id = config.nextConfigChangeId();
+        (, , , dev) = h.oracleOf(token);
+        assertEq(dev, 100, "band change not applied before delay");
+        vm.warp(block.timestamp + h.roleChangeDelay() + 1);
+        config.executeConfigChange(id);
+        (, , , dev) = h.oracleOf(token);
+        assertEq(dev, 200, "band change applied after delay");
+    }
+
+    // ============================================================
     // Per-maker pool segregation + funder gating
     // ============================================================
 
@@ -821,7 +913,7 @@ contract HitOneMarketTest is Test {
     function test_oracleBandOwnerSetAndEnforced() public {
         // Owner sets a 1% band vs a mock feed at $50k (8-dec), 6h staleness (push heartbeat).
         MockAggregatorV3 feed = new MockAggregatorV3(8, 50_000e8, block.timestamp);
-        h.setOracle(token, address(feed), 8, 6 hours, 100);
+        config.setOracle(token, address(feed), 8, 6 hours, 100);
         (address f, , , uint16 dev) = h.oracleOf(token);
         assertEq(f, address(feed));
         assertEq(dev, 100);
@@ -848,11 +940,11 @@ contract HitOneMarketTest is Test {
     function test_setOracleRejectsBadBand() public {
         MockAggregatorV3 feed = new MockAggregatorV3(8, 50_000e8, block.timestamp);
         vm.expectRevert(IHitOneMarket.BadOracleConfig.selector);
-        h.setOracle(token, address(feed), 8, 10 minutes, 0);        // zero band
+        config.setOracle(token, address(feed), 8, 10 minutes, 0);        // zero band
         vm.expectRevert(IHitOneMarket.BadOracleConfig.selector);
-        h.setOracle(token, address(feed), 8, 10 minutes, 10_001);   // > 100%
+        config.setOracle(token, address(feed), 8, 10 minutes, 10_001);   // > 100%
         vm.expectRevert(IHitOneMarket.BadOracleConfig.selector);
-        h.setOracle(token, address(feed), 8, 0, 100);               // zero staleness
+        config.setOracle(token, address(feed), 8, 0, 100);               // zero staleness
     }
 
     // ============================================================
@@ -1053,13 +1145,17 @@ contract HitOneMarketTest is Test {
     // ============================================================
 
     function _setCutRamp(uint256 intercept, uint256 slopeBps, uint256 maxBps) internal {
-        // Cut params are token-level structural (owner-set). Re-register with the new ramp; the
-        // maker's own risk + marks are unaffected.
+        // Cut params are token-level structural (owner-set). The token is already registered, so
+        // this is a TIMELOCKED change: queue it, warp past the delay, execute.
         ParamCatalog.Structural memory s = _structural();
         s.cutIntercept = intercept;
         s.cutSlopeBps  = slopeBps;
         s.maxCutBps    = maxBps;
-        h.setToken(token, s);
+        config.setToken(token, s);
+        uint256 id = config.nextConfigChangeId();
+        _t += uint64(h.roleChangeDelay() + 1);
+        vm.warp(_t);
+        config.executeConfigChange(id);
     }
 
     function test_cutZeroBelowIntercept() public {

@@ -64,6 +64,10 @@ abstract contract HitOneStorage is
     mapping(address => address) public override makerFunder;
     /// @notice Emergency-halt role set. Only these addresses may `halt`/`unhalt`.
     mapping(address => bool) public override isHalter;
+    /// @notice `HitOneConfig` authorized to write owner params (structural/oracle) via `apply*`.
+    /// Owner-set: instant on first (bootstrap) set, timelocked to swap. Validation + the owner-param
+    /// timelock live in the config contract; the market only does the raw writes.
+    address public override configurator;
 
     /// @notice Token-level params (owner-curated, one per token): tick grid, leverage bounds,
     /// duration, house cut. Only `.structural` is used; risk is per-maker (`_makerRisk`).
@@ -173,6 +177,10 @@ abstract contract HitOneStorage is
     }
     modifier onlyMakerFunder(address maker) {
         if (msg.sender != _effectiveFunder(maker)) revert NotFunder();
+        _;
+    }
+    modifier onlyConfigurator() {
+        if (msg.sender != configurator) revert NotConfigurator();
         _;
     }
     modifier whenNotHalted() {

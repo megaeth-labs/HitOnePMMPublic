@@ -31,8 +31,9 @@ end-to-end in one file. Storage lives in exactly one place.
 | `HitOneOrders.sol`    | EIP-712 order digest, signature/nonce verification, slippage-band check. |
 | `HitOneMarks.sol`     | Mark + funding-rate push logic, oracle-band check, HP-timestamp read, mark-domain views (`marketOf`, `rateRingAt`). |
 | `HitOnePositions.sol` | Position lifecycle: open, increase, close/decrease, expire, settle, liquidate, position views. |
-| `HitOneAdmin.sol`     | Owner/maker/funder/halter admin, timelocked role changes, halt/unhalt, token/oracle config, per-maker pool funding + timelocked withdrawals. |
-| `HitOneMarket.sol`    | Concrete contract; just the constructor + inheritance (`HitOnePositions`, `HitOneAdmin`). |
+| `HitOneAdmin.sol`     | Halter role (timelocked), halt/unhalt, per-maker `setRiskLimits` + pool funding + timelocked withdrawals, configurator wiring, and the raw `apply*` param writers. |
+| `HitOneMarket.sol`    | Concrete market; just the constructor + inheritance (`HitOnePositions`, `HitOneAdmin`). |
+| `HitOneConfig.sol`    | **Separate contract.** Validation + the owner-param **timelock** for `setToken`/`setOracle`; calls the market's `apply*`. Keeps the market under EIP-170. |
 | `IHitOneMarket.sol`   | Full external interface: events, errors, structs, function signatures. **Start here when integrating.** |
 
 Shared libraries in `../common/`:
@@ -55,7 +56,7 @@ absolute ones.
 
 | Role | Set by | Powers |
 |---|---|---|
-| **owner** | constructor / `transferOwnership` | Curates tokens (`setToken` structural grid, `setOracle`), `setWithdrawDelay`, queue/cancel the `halter` set, `cancelRoleChange`. **Cannot** register makers, touch any maker's pool, halt, or unhalt. |
+| **owner** | constructor / `transferOwnership` | Curates tokens (`setToken` grid, `setOracle` band) **via `HitOneConfig`, timelocked**; `setWithdrawDelay`, queue/cancel the `halter` set + configurator swap. **Cannot** register makers, touch any maker's pool, halt, unhalt, or change token/oracle params instantly. |
 | **maker** | **permissionless** — no registration | Any address, on any owner-registered token: `setRiskLimits` (its own), push marks (`setMark`/`setMarkAndRate`), submit orders naming itself (`openPosition`/`increasePosition`/`closePosition`), `liquidate` its own book, `setMakerFunder`. Each maker's marks/funding/risk/OI/pool are keyed `(maker, token)` and fully isolated. |
 | **funder** | `setMakerFunder(maker, …)` — **self-set by the maker** | Per-maker treasury key. Fund / queue-withdraw / cancel-withdraw for **that maker's pool only**. Defaults to the maker itself when unset; once set, only the funder may rotate it (hot-maker / cold-funder split). |
 | **halter** | `queueSetHalter(addr, allowed)` (owner, timelocked) | `halt`, `unhalt` (after cooldown), `setPausedNew`. **Multiple allowed** (`isHalter` set). Only halters may halt/unhalt — makers, funders and the owner cannot unless separately granted the halter role. |
@@ -97,7 +98,10 @@ Halt semantics:
    - `!nonceUsed[user][channel][nonce]` then marks it used (`NonceAlreadyUsed`);
    - `ECDSA.recover(digest) == order.user` (else `BadUserSig`);
    - slippage band: `|fillPrice − targetPrice| * 10000 <= targetPrice * maxSlippageBps`
-     (else `SlippageExceeded`);
+     (else `SlippageExceeded`). **On open/increase the open fee is folded in**: the effective
+     entry `fillPrice × (1 ± openFeeBps/1e4)` (worse for the side taken) must sit inside the band,
+     so the all-in cost — fee included — can never exceed the user's signed worst price. A maker
+     therefore can't extract more fee than the user consented to.
    - `order.isOpen` matches the action (open/increase require `true`, close requires `false`).
 
 `Order` fields (see `IHitOneMarket`): `user, token, isLong, isOpen, size (1e18 asset-wei),
@@ -253,12 +257,20 @@ of old and added; the open fee and OI/notional exposure are charged only on the 
 
 ---
 
-## 8. Parameters: token-level structural (owner) vs per-maker risk
+## 8. Parameters: token-level structural (owner, timelocked) vs per-maker risk (instant)
 
-**Structural** is token-level and owner-set via `setToken(token, Structural)` — one grid per
-token, shared by every maker on it (so units stay coherent for the oracle). `priceTick == 0`
-**deregisters** the token. **Risk** is per-`(maker, token)` and set by the maker itself via
-`setRiskLimits(token, Risk)` — permissionless, and a maker's book is **inert until it sets risk**
+**What protects users is owner-set and timelocked; what protects the maker's own book is
+maker-set and instant.** Owner params (`setToken` structural grid + `setOracle` band) go through
+the **`HitOneConfig`** contract, which validates then calls the market's `apply*` writers: the
+**first** registration / oracle-set is instant (launch isn't blocked), every **change** after is
+timelocked by `roleChangeDelay()` (2× `withdrawDelay`) — `queue → executeConfigChange` after the
+delay, or `cancelConfigChange` (owner). Read them back on the market with `structuralOf` /
+`oracleOf`.
+
+**Structural** is token-level (one grid per token, shared by every maker on it, so units stay
+coherent for the oracle). `priceTick == 0` **deregisters** the token. **Risk** is per-`(maker,
+token)` and set by the maker itself via `setRiskLimits(token, Risk)` — permissionless and
+**instant** (it protects the maker's own book), and a maker's book is **inert until it sets risk**
 (the un-set default leaves `maxPositionNotional == 0`, which blocks all opens). Read them back
 with `structuralOf(token)` and `makerRiskOf(maker, token)`.
 
@@ -308,9 +320,12 @@ unset risk struct leaves `maxPositionNotional == 0` and blocks opens — set it 
 
 ### Oracle band (owner-set per token — the context makers operate within)
 
-`setOracle(token, feed, decimals, maxStale, maxDevBps)` (**owner**, optional; `feed == 0`
-disables). It's the one price guardrail the owner defines for a token; every maker's marks on that
-token are checked against the same feed and band, so a maker cannot widen it. On each mark push
+`HitOneConfig.setOracle(token, feed, decimals, maxStale, maxDevBps)` (**owner**, optional; `feed
+== 0` disables; first set instant, changes timelocked). It's the one price guardrail the owner
+defines for a token; every maker's marks on that token are checked against the same feed and band,
+so a maker cannot widen it. Note `maxDevBps` lives **only** here (owner) — the `maxDevBps` field in
+the per-maker `Risk` struct is a vestigial, ignored leftover of the shared `ParamCatalog.Risk`
+type. On each mark push
 (`setMark`/`setMarkAndRate`, open/close/liquidate) the contract checks
 `|newMark − oraclePrice| * 10000 <= maxDevBps * oraclePrice` and staleness
 (`block.timestamp <= updatedAt + maxStale`), reverting `MarkOutOfOracleBand` / `OracleStale` /
@@ -328,8 +343,8 @@ drifting far enough to exploit anyone.
   fine. For a tighter *guaranteed* freshness bound later, ask RedStone for a shorter-heartbeat feed
   or use Bolt (same interface, same read cost). Feeds are USD-denominated (8-dec); to guard against
   a USDm de-peg, normalize by the `USDm-TWAP-60` feed.
-- **Not yet timelocked.** `setOracle` (and `setToken`) take effect immediately; time-delaying the
-  owner's token-context changes is a planned follow-up.
+- **Timelocked.** `setOracle` (and `setToken`) go through `HitOneConfig`: the first set is instant,
+  every change after waits `roleChangeDelay()` (12 h default) before `executeConfigChange`.
 
 Risk caps enforced at open/increase: `PositionNotionalCap`, `OIGrossCap`, `OISkewCap`.
 
@@ -389,20 +404,23 @@ event.
 Constructor: `HitOneMarket(owner, usdm)` — sets the owner and caches USDM decimals. No initial
 maker (registration is permissionless). EIP-712 domain is fixed to `("HitOneMarket", "1")`.
 
-**Bring-up.** Owner side: deploy → `setToken` for each token → `queueSetHalter` → wait
-`roleChangeDelay()` (12 h at the default 6 h `withdrawDelay`) → `executeRoleChange` → optionally
-`transferOwnership`. Maker side (permissionless, any time after the token is registered):
-`setRiskLimits` → optional `setMakerFunder` → `fundMakerPool` → `setMark`. The only timelocked
-step is installing halters; makers need no owner involvement.
+**Bring-up.** Owner side: deploy market → deploy `HitOneConfig(market)` → `setConfigurator(config)`
+(instant bootstrap) → `config.setToken` for each token (first registration instant) → optional
+`config.setOracle` (first set instant) → `queueSetHalter` → wait `roleChangeDelay()` (12 h at the
+default 6 h `withdrawDelay`) → `executeRoleChange` → optionally `transferOwnership`. Maker side
+(permissionless, any time after the token is registered): `setRiskLimits` → optional
+`setMakerFunder` → `fundMakerPool` → `setMark`. Owner param *changes* after bring-up are timelocked
+via the config; makers need no owner involvement.
 
 Scripts (`script/hitone/`): `DeployHitOne.s.sol` (owner bring-up + a self-registered maker),
 `SimHitOneTrade.s.sol` (real on-chain open→close round trip — run it twice, it opens then closes),
 and `RedStoneFeeds.sol` (per-chain oracle feed addresses + recommended band values).
 
-**Contract-size note.** `HitOneMarket` runs near the EIP-170 24 576-byte limit (~23.5 KB, ~1 KB
+**Contract-size note.** `HitOneMarket` runs near the EIP-170 24 576-byte limit (~23.9 KB, ~0.7 KB
 margin). `foundry.toml` strips metadata (`bytecode_hash = "none"`, `cbor_metadata = false`), and to
 make room several off-chain-derivable views were dropped: `reconstructAt`, and the live `liqPrice`
-/ `fundingOwed` fields of `positions()` (compute them from the returned fields + `marketOf`). We
-measured moving the math/validation into external libraries or a config contract — both made it
-*bigger*, not smaller (delegatecall/plumbing glue > the inlined code). So trimming views is the
-lever; adding surface area may re-breach the limit.
+/ `fundingOwed` fields of `positions()` (compute them from the returned fields + `marketOf`).
+Trimming views is the size lever — we measured that moving the math into external libraries makes
+the market *bigger* (delegatecall glue > inlined bodies). `HitOneConfig` exists partly to keep
+future owner-param logic (the timelock, and anything after) off the market entirely. Adding
+surface area to the market may re-breach the limit — measure first.
