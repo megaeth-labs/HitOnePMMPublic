@@ -13,7 +13,7 @@ import { MockERC20 } from "../mocks/MockERC20.sol";
 import { MockAggregatorV3 } from "../mocks/MockAggregatorV3.sol";
 
 contract H2MarketTest is Test {
-    H2Market  internal h;
+    H2MarketHarness internal h;
     H2Oracle  internal oracle;
     BuilderRegistry internal reg;       // per-market builder eligibility (native-ETH stake)
     MockERC20 internal usdm;
@@ -127,7 +127,7 @@ contract H2MarketTest is Test {
         oracle = new H2Oracle();
         ref = new MockAggregatorV3(8, 50_000e8, block.timestamp);
         fallbackFeed = new MockAggregatorV3(8, 50_000e8, block.timestamp);
-        h = new H2Market(address(usdm), address(oracle));
+        h = new H2MarketHarness(address(usdm), address(oracle));
         reg = new BuilderRegistry(address(0), MIN_BUILDER_STAKE); // native-ETH stake
         token = makeAddr("btc");
 
@@ -1135,11 +1135,180 @@ contract H2MarketTest is Test {
         // NOT base + skew = 3000 ppm → 49_850 (what position-side keying would have charged).
         assertEq(h.positions(id).closePrice, 49_950e18, "long close (sell) gets the rebated 1000ppm");
     }
+
+    // ============================================================
+    // marked-to-market NAV
+    // ============================================================
+
+    uint256 constant _PT = 1e18;  // priceTick
+    uint256 constant _ST = 1e10;  // sizeTick
+
+    function _openShort(uint256 pk, uint256 size, uint256 lev, uint256 mark, uint256 nonce)
+        internal returns (uint256 id)
+    {
+        _adv(1);
+        IH2Market.Order memory o = _order(pk, false, true, size, lev, mark, 200, nonce);
+        _pushOrder(mark, o, _sign(pk, o), 0);
+        id = h.activePositionId(vm.addr(pk), mkt);
+    }
+
+    /// @dev Full-close the caller's active position at `mark` (generous band).
+    function _closeAll(uint256 pk, uint256 mark, uint256 nonce) internal {
+        _adv(1);
+        uint256 id = h.activePositionId(vm.addr(pk), mkt);
+        IH2Market.PositionView memory p = h.positions(id);
+        // Target the mark itself with a wide band so a flat close always fills.
+        IH2Market.Order memory c = _order(pk, p.isLong, false, p.size, 0, mark, 1000, nonce);
+        _pushOrder(mark, c, _sign(pk, c), 0);
+    }
+
+    /// @dev One open position's contribution to its side's aggregates (0 once closed).
+    function _aggContribution(uint256 id) internal view returns (uint256 sizeU, uint256 entryW, int256 checkW) {
+        IH2Market.PositionView memory p = h.positions(id);
+        if (p.closed) return (0, 0, 0);
+        sizeU  = p.size / _ST;
+        entryW = (p.entryPrice / _PT) * sizeU;
+        checkW = int256(p.fundingCheckpoint) * int256(sizeU);
+    }
+
+    /// The per-side aggregates equal the live Σ over open positions, and fully unwind to 0 on close.
+    function test_mtm_aggregatesTrackAndUnwind() public {
+        uint256 la = _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        uint256 sb = _openShort(bobPk, 2e18, 100, 50_000e18, 0);
+
+        (uint256 ls, uint256 le, int256 lc) = h.aggOf(mkt, true);
+        (uint256 e1s, uint256 e1e, int256 e1c) = _aggContribution(la);
+        assertEq(ls, e1s, "long sumSize"); assertEq(le, e1e, "long sumEntryW"); assertEq(lc, e1c, "long sumCheckW");
+
+        (uint256 ss, uint256 se, int256 sc) = h.aggOf(mkt, false);
+        (uint256 e2s, uint256 e2e, int256 e2c) = _aggContribution(sb);
+        assertEq(ss, e2s, "short sumSize"); assertEq(se, e2e, "short sumEntryW"); assertEq(sc, e2c, "short sumCheckW");
+
+        _closeAll(alicePk, 50_000e18, 1);
+        _closeAll(bobPk, 50_000e18, 1);
+        (ls, le, lc) = h.aggOf(mkt, true);
+        (ss, se, sc) = h.aggOf(mkt, false);
+        assertEq(ls, 0, "long unwinds"); assertEq(le, 0); assertEq(lc, 0);
+        assertEq(ss, 0, "short unwinds"); assertEq(se, 0); assertEq(sc, 0);
+    }
+
+    /// _mtmValue == poolAssets − a single position's unrealized price PnL, to the wei (both signs).
+    function test_mtm_equalsPoolMinusUnrealized_long() public {
+        _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        _pushMark(51_000e18, 0, 0, 0); // +1000·sizeUnits(1e8)·notionalScale(1e10) = 1000e18 profit
+        IH2Market.VaultView memory v = h.vaultOf(mkt);
+        assertEq(v.poolAssets - v.mtmValue, 1000e18, "pool owes the long's unrealized profit");
+        _adv(1);
+        _pushMark(49_000e18, 0, 0, 0); // loss → pool MTM-richer by the loss
+        v = h.vaultOf(mkt);
+        assertEq(v.mtmValue - v.poolAssets, 1000e18, "pool gains the long's unrealized loss");
+    }
+
+    function test_mtm_equalsPoolMinusUnrealized_short() public {
+        _openShort(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        _pushMark(49_000e18, 0, 0, 0); // short profits when price falls
+        IH2Market.VaultView memory v = h.vaultOf(mkt);
+        assertEq(v.poolAssets - v.mtmValue, 1000e18, "pool owes the short's unrealized profit");
+    }
+
+    /// Funding is in the MTM: a long paying funding reduces the pool's liability (mtm rises).
+    function test_mtm_includesFunding() public {
+        _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        _pushMark(51_000e18, 0, 0, 0);
+        uint256 mtmNoFunding = h.vaultOf(mkt).mtmValue;
+        _adv(1);
+        _pushMark(51_000e18, int64(RATE_CAP), 0, 0); // positive long rate: longs pay
+        _adv(100);
+        _pushMark(51_000e18, int64(RATE_CAP), 0, 0);
+        assertGt(h.vaultOf(mkt).mtmValue, mtmNoFunding, "long-paid funding lowers the pool liability");
+    }
+
+    /// EXIT: traders net-up ⇒ an LP redeems at the MTM (lower) value, not the stale poolAssets,
+    /// and the pool still covers the winner (no first-mover extraction / stranding).
+    function test_mtm_exitPricesAtMtmNotStalePool() public {
+        _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        _pushMark(51_000e18, 0, 0, 0);
+        IH2Market.VaultView memory v = h.vaultOf(mkt);
+        uint256 pa = v.poolAssets;
+        assertEq(pa - v.mtmValue, 1000e18, "liability booked");
+
+        uint256 shares = h.stakeOf(mkt, carl).shares;
+        vm.prank(carl); h.requestUnstake(mkt, shares);
+        _adv(uint256(TERM) + 1);
+        vm.prank(carl);
+        uint256 got = h.withdraw(mkt);
+        assertLt(got, pa, "redeemed at mtm, not the stale overstated poolAssets");
+
+        // the winner can still close — the exit did not strand them
+        _adv(1);
+        IH2Market.Order memory c = _order(alicePk, true, false, 1e18, 0, 51_000e18, 1000, 1);
+        _pushOrder(51_000e18, c, _sign(alicePk, c), 0);
+        assertEq(h.activePositionId(alice, mkt), 0, "winner closed, pool covered the payout");
+    }
+
+    /// ENTRY: traders net-down ⇒ a depositor mints against the (higher) MTM, so NO outsized shares.
+    function test_mtm_entryNoOutsizedShares() public {
+        _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        _pushMark(49_000e18, 0, 0, 0); // alice down 1000e18 → pool MTM-richer
+        IH2Market.VaultView memory v = h.vaultOf(mkt);
+        assertEq(v.mtmValue - v.poolAssets, 1000e18, "pool richer by the unrealized loss");
+        uint256 ts = v.totalShares; uint256 pa = v.poolAssets; uint256 mtm = v.mtmValue;
+
+        usdm.mint(bob, 1_000e18);
+        vm.prank(bob); h.deposit(mkt, 1_000e18);
+        uint256 got = h.stakeOf(mkt, bob).shares;
+        uint256 naive = (1_000e18 * (ts + 1)) / (pa + 1);   // poolAssets-basis = the exploit
+        uint256 fair  = (1_000e18 * (ts + 1)) / (mtm + 1);  // mtm-basis = what we mint
+        assertEq(got, fair, "minted against mtm");
+        assertLt(got, naive, "no outsized mint");
+    }
+
+    /// ILLIQUID: traders net-down ⇒ mtm > poolAssets, so a full redemption exceeds liquid cash and
+    /// reverts; once the position settles into the pool, the withdrawal succeeds.
+    function test_mtm_withdrawRevertsWhenIlliquid() public {
+        _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1);
+        _pushMark(49_900e18, 0, 0, 0); // loss 100e18 (< col) → mtm = pa + 100 > pa
+        uint256 shares = h.stakeOf(mkt, carl).shares;
+        vm.prank(carl); h.requestUnstake(mkt, shares);
+        _adv(uint256(TERM) + 1);
+        vm.prank(carl);
+        vm.expectRevert(IH2Market.InsufficientLiquidity.selector);
+        h.withdraw(mkt);
+
+        // settle the loser into the pool, then the full redemption fits
+        _adv(1);
+        IH2Market.Order memory c = _order(alicePk, true, false, 1e18, 0, 49_900e18, 1000, 1);
+        _pushOrder(49_900e18, c, _sign(alicePk, c), 0);
+        assertEq(h.activePositionId(alice, mkt), 0, "loss settled");
+        vm.prank(carl);
+        uint256 got = h.withdraw(mkt);
+        assertGt(got, 0, "withdraw succeeds after settlement");
+    }
 }
 
 /// @dev A builder registry that always reverts — for the market's try/catch safety test.
 contract RevertingRegistry is IBuilderRegistry {
     function isBuilder(address) external pure override returns (bool) {
         revert("nope");
+    }
+}
+
+/// @dev H2Market with getters for the internal MTM aggregates + value (test-only).
+contract H2MarketHarness is H2Market {
+    constructor(address usdm_, address oracle_) H2Market(usdm_, oracle_) {}
+
+    function aggOf(uint256 marketId, bool isLong) external view returns (uint256, uint256, int256) {
+        OpenAgg storage a = _openAgg[marketId][isLong];
+        return (a.sumSize, a.sumEntryW, a.sumCheckW);
+    }
+
+    function mtm(uint256 marketId) external view returns (uint256) {
+        return _mtmValue(marketId);
     }
 }

@@ -14,6 +14,8 @@ import { IH2Market } from "./IH2Market.sol";
 import { IH2Oracle } from "./IH2Oracle.sol";
 import { IBuilderRegistry } from "./IBuilderRegistry.sol";
 import { IHighPrecisionTimestamp } from "../common/IHighPrecisionTimestamp.sol";
+import { FundingIndex } from "../common/FundingIndex.sol";
+import { ParamCatalog } from "../common/ParamCatalog.sol";
 
 /// @title H2Storage
 /// @notice Shared storage layout, constants, immutables, modifiers and helpers for the H2
@@ -150,6 +152,19 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
     }
     mapping(uint256 => mapping(address => Unstake)) internal _unstake;
 
+    /// @notice Per-side running aggregates of OPEN positions, for the marked-to-market NAV
+    /// (see `_mtmValue`). `sumSize` = Σ size (sizeUnits); `sumEntryW` = Σ entryPrice·size;
+    /// `sumCheckW` = Σ fundingCheckpoint·size (signed). Maintained O(1) on every
+    /// open/increase/decrease/close/wipe so the NAV can value open positions without
+    /// iterating them. Bounded by the market's OI caps (another reason to set real
+    /// `maxOIGross`), but kept in full-width 256-bit to never silently wrap.
+    struct OpenAgg {
+        uint256 sumSize;
+        uint256 sumEntryW;
+        int256  sumCheckW;
+    }
+    mapping(uint256 => mapping(bool => OpenAgg)) internal _openAgg;
+
     constructor(address usdm_, address oracle_) {
         if (usdm_ == address(0) || oracle_ == address(0)) revert ZeroAddress();
         usdm = IERC20(usdm_);
@@ -185,6 +200,75 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
         if (t > 1e14) return t / 1_000_000;
         if (t > 1e11) return t / 1_000;
         return t;
+    }
+
+    // ---- marked-to-market NAV ----
+
+    /// @dev Add an opening slice to its side's open-position aggregates.
+    function _openAggAdd(uint256 marketId, bool isLong, uint256 size, uint256 entry, int256 check) internal {
+        OpenAgg storage a = _openAgg[marketId][isLong];
+        a.sumSize   += size;
+        a.sumEntryW += entry * size;
+        a.sumCheckW += check * int256(size);
+    }
+
+    /// @dev Remove a slice from its side's aggregates — a full close, a decrease portion, a
+    /// liquidation wipe, or the OLD state of an increase. Uses the STORED (rounded) entry and
+    /// checkpoint so the aggregate tracks exactly what settlement will compute.
+    function _openAggSub(uint256 marketId, bool isLong, uint256 size, uint256 entry, int256 check) internal {
+        OpenAgg storage a = _openAgg[marketId][isLong];
+        a.sumSize   -= size;
+        a.sumEntryW -= entry * size;
+        a.sumCheckW -= check * int256(size);
+    }
+
+    /// @dev One side's unrealized effective PnL (price PnL − own-side funding) aggregated over its
+    /// open positions, mirroring `_settleSlice`. Price PnL is exact; the funding term divides the
+    /// summed numerator once (vs once per position in `_settleSlice`), so a multi-position pool's
+    /// funding differs by < 1 wei per position in the SCALE division — negligible, and exact for a
+    /// single position. Positive ⇒ traders up ⇒ the pool owes it.
+    function _sideEffPnl(uint256 marketId, bool isLong, uint256 markUnits, int128 indexNow)
+        internal view returns (int256)
+    {
+        OpenAgg storage a = _openAgg[marketId][isLong];
+        uint256 sz = a.sumSize;
+        if (sz == 0) return 0;
+        RiskParams storage r = _risk[marketId];
+        int256 markTerm  = int256(markUnits) * int256(sz);
+        int256 entryTerm = int256(a.sumEntryW);
+        // long profits when mark > entry; short when entry > mark (mirrors _settleSlice's priceDiff).
+        int256 priceDiff = isLong ? (markTerm - entryTerm) : (entryTerm - markTerm);
+        int256 pricePnl  = priceDiff * int256(uint256(r.notionalScale));
+        int256 funding   = (int256(indexNow) * int256(sz) - a.sumCheckW)
+                           * int256(uint256(r.sizeTick)) / int256(ParamCatalog.SCALE);
+        return pricePnl - funding;
+    }
+
+    /// @dev The vault's MARKED-TO-MARKET value: `poolAssets` minus the net unrealized effPnl the
+    /// pool owes its open positions (their profit is the pool's liability). `deposit`/`withdraw`
+    /// price against this, not raw `poolAssets`, so a stale-NAV first-mover can neither extract on
+    /// exit (traders net-up ⇒ mtm < poolAssets) nor mint outsized shares on entry (traders net-down
+    /// ⇒ mtm > poolAssets). O(1) from the per-side aggregates.
+    ///
+    /// APPROXIMATION (accepted): uses UNCAPPED unrealized loss — a losing position cannot actually
+    /// lose past its collateral (beyond that it is liquidatable), so mtm slightly overstates the
+    /// pool's claim on deeply-underwater, not-yet-liquidated positions; `liqWidthPpm` bounds that
+    /// window. It also ignores the (non-linear, un-aggregatable) winnings cut, which only
+    /// understates the LPs' share — conservative.
+    function _mtmValue(uint256 marketId) internal view returns (uint256) {
+        uint256 pool = uint256(_vault[marketId].poolAssets);
+        IH2Oracle.FeedView memory feed = _oracle.feedOf(_oracles[marketId].primaryFeedId);
+        if (feed.lastPushMs == 0) return pool; // never pushed ⇒ no open positions
+        uint64 nowMs = uint64(_microTimestamp() / 1000);
+        int128 idxLong = FundingIndex.effectiveAtPctMs(
+            feed.fundingIndexLong, feed.rateLong, feed.mark, feed.lastPushMs, nowMs);
+        int128 idxShort = FundingIndex.effectiveAtPctMs(
+            feed.fundingIndexShort, feed.rateShort, feed.mark, feed.lastPushMs, nowMs);
+        uint256 markUnits = feed.mark / _risk[marketId].priceTick;
+        int256 net = _sideEffPnl(marketId, true, markUnits, idxLong)
+                   + _sideEffPnl(marketId, false, markUnits, idxShort);
+        int256 mtm = int256(pool) - net;
+        return mtm <= 0 ? 0 : uint256(mtm);
     }
 
     // ---- builder eligibility ----

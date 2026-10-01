@@ -43,8 +43,11 @@ abstract contract H2Treasury is H2Storage {
             revert UnbandedFeed();
 
         Vault storage v = _vault[marketId];
-        // Mint at NAV with a virtual offset: shares = assets · (totalShares+1)/(poolAssets+1).
-        shares = Math.mulDiv(assets, v.totalShares + 1, uint256(v.poolAssets) + 1);
+        // Mint at the MARKED-TO-MARKET NAV with a virtual offset:
+        //   shares = assets · (totalShares+1)/(mtmValue+1).
+        // mtmValue nets the open positions' unrealized PnL into the pool, so a depositor can't mint
+        // outsized shares when the pool has unbooked gains (traders net-down). See `_mtmValue`.
+        shares = Math.mulDiv(assets, v.totalShares + 1, _mtmValue(marketId) + 1);
         if (shares == 0) revert ZeroAmount();
 
         usdm.safeTransferFrom(msg.sender, address(this), assets);
@@ -75,9 +78,14 @@ abstract contract H2Treasury is H2Storage {
         uint256 held = _shares[marketId][msg.sender];
         // The request may exceed the balance if the holder can burn shares elsewhere — clamp.
         uint256 burn = u.shares > held ? held : u.shares;
-        // Redeem at NAV with the virtual offset: assets = burn · (poolAssets+1)/(totalShares+1).
-        // Floored, so assets ≤ poolAssets always (the offset keeps the vault solvent).
-        assets = Math.mulDiv(burn, uint256(v.poolAssets) + 1, v.totalShares + 1);
+        // Redeem at the MARKED-TO-MARKET NAV: assets = burn · (mtmValue+1)/(totalShares+1).
+        // mtm < poolAssets when traders are net-up, so an exiter can't extract the stale overstated
+        // value. When traders are net-DOWN, mtm > poolAssets: the share is worth more than the
+        // liquid cash (the gains are still locked in unrealized trader losses, not yet in
+        // poolAssets), so a full redemption can exceed what's payable — require it to fit the liquid
+        // pool and let the LP wait for those positions to settle.
+        assets = Math.mulDiv(burn, _mtmValue(marketId) + 1, v.totalShares + 1);
+        if (assets > uint256(v.poolAssets)) revert InsufficientLiquidity();
 
         _shares[marketId][msg.sender] = held - burn;
         v.totalShares -= burn;
@@ -124,10 +132,12 @@ abstract contract H2Treasury is H2Storage {
     function vaultOf(uint256 marketId) external view override returns (VaultView memory) {
         if (_creatorOf[marketId] == address(0)) revert UnknownMarket();
         Vault storage v = _vault[marketId];
+        uint256 mtm = _mtmValue(marketId);
         return VaultView({
             totalShares:   v.totalShares,
             poolAssets:    v.poolAssets,
-            sharePrice:    Math.mulDiv(uint256(v.poolAssets) + 1, WAD, v.totalShares + 1),
+            mtmValue:      mtm,
+            sharePrice:    Math.mulDiv(mtm + 1, WAD, v.totalShares + 1),
             rakeOwed:      v.rakeOwed,
             rakeRecipient: _oracle.feedOf(_oracles[marketId].primaryFeedId).operator,
             rakePpm:       v.rakePpm
