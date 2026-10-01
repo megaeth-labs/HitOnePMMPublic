@@ -169,8 +169,9 @@ interface IH2Market {
     /// @notice A market's share vault.
     struct VaultView {
         uint256 totalShares;
-        uint256 poolAssets;     // USDM backing the shares (post-rake)
-        uint256 sharePrice;     // poolAssets per share, 1e18-scaled (virtual-offset)
+        uint256 poolAssets;     // USDM backing the shares (post-rake), settled basis
+        uint256 mtmValue;       // marked-to-market vault value = poolAssets − net unrealized trader PnL
+        uint256 sharePrice;     // mtmValue per share, 1e18-scaled (virtual-offset) — the NAV used to mint/redeem
         uint256 rakeOwed;       // feed operator's accrued rake, claimable
         address rakeRecipient;  // the feed operator
         uint256 rakePpm;        // the feed's frozen rake
@@ -319,6 +320,7 @@ interface IH2Market {
     error InsufficientShares(); // unstake request exceeds shares held
     error NothingStaked();    // no pending unstake to withdraw
     error CooldownActive();   // withdraw before the unstake cooldown elapsed
+    error InsufficientLiquidity(); // withdrawal's MTM value exceeds liquid poolAssets — wait for open positions to settle
     error NotFeedOperator();  // claimRake caller is not the primary feed's operator
     error ZeroAddress();
     error ZeroAmount();

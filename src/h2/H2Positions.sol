@@ -173,6 +173,8 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
             makerCutPaid:      0,
             lastActionBlock:   uint64(block.number)
         });
+        // MTM aggregates: this side gains a slice (size, entry·size, checkpoint·size).
+        _openAggAdd(marketId, order.isLong, sizeUnits, fillUnits, fundingNow);
 
         emit PositionOpened(
             id, order.user, marketId, order.isLong, order.size,
@@ -238,7 +240,9 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
 
         int128 fundingNow = _indexNow(feed, order.isLong);
 
-        uint256 oldSize = uint256(pos.size);
+        uint256 oldSize  = uint256(pos.size);
+        uint256 oldEntry = uint256(pos.entryPrice);          // captured for the MTM aggregate delta
+        int256  oldCheck = int256(pos.fundingCheckpoint);    // (before the blend overwrites them)
         uint256 newSize = oldSize + uint256(addSizeUnits);
         if (newSize >= UNITS_CAP)              revert BadSize();
         if (totalNotional > type(uint128).max) revert BadSize();
@@ -271,6 +275,11 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         pos.openTime          = uint64(block.timestamp);
         pos.openMs            = uint64(_microTimestamp() / 1000);
         pos.lastActionBlock   = uint64(block.number);
+
+        // MTM aggregates: swap the OLD stored state for the NEW blended state (both against the
+        // rounded values actually stored), so the aggregate delta is exactly add − old.
+        _openAggSub(marketId, order.isLong, oldSize, oldEntry, oldCheck);
+        _openAggAdd(marketId, order.isLong, newSize, newEntry, newCheckpoint);
 
         openInterestLong[marketId]  = newLong;
         openInterestShort[marketId] = newShort;
@@ -363,6 +372,8 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
 
         _applyTreasuryDelta(marketId, uint256(pos.col), pnl, fundingPaid, cut, b, id);
         _decreaseOI(marketId, pos.isLong, uint256(pos.notionalAtOpen));
+        // MTM aggregates: the whole position leaves.
+        _openAggSub(marketId, pos.isLong, pos.size, pos.entryPrice, pos.fundingCheckpoint);
 
         int256 effPnlNet = pnl - fundingPaid - int256(closeFee);
         pos.closed       = true;
@@ -403,6 +414,9 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         uint256 notionalPortion = uint256(pos.notionalAtOpen) * closeSizeUnits / pos.size;
         _decreaseOI(marketId, pos.isLong, notionalPortion);
 
+        // MTM aggregates: the closed portion leaves; the remainder keeps its entry/checkpoint.
+        _openAggSub(marketId, pos.isLong, closeSizeUnits, pos.entryPrice, pos.fundingCheckpoint);
+
         pos.size           = pos.size - closeSizeUnits;
         pos.col            = uint128(uint256(pos.col) - colPortion);
         pos.notionalAtOpen = uint128(uint256(pos.notionalAtOpen) - notionalPortion);
@@ -441,6 +455,8 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         uint256 marketId = pos.marketId;
         uint256 wiped = uint256(pos.col);
         _decreaseOI(marketId, pos.isLong, uint256(pos.notionalAtOpen));
+        // MTM aggregates: the wiped position leaves.
+        _openAggSub(marketId, pos.isLong, pos.size, pos.entryPrice, pos.fundingCheckpoint);
         _credit(marketId, wiped);
         pos.closed      = true;
         pos.closeTime   = uint64(block.timestamp);

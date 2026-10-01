@@ -19,25 +19,60 @@ being its house.
 
 ## Shares and NAV
 
-The vault is standard ERC-4626-style share accounting with a virtual offset:
+The vault is ERC-4626-style share accounting with a virtual offset, priced off a
+**marked-to-market value** (`mtmValue`), not raw `poolAssets`:
 
 ```
-deposit:   shares = assets · (totalShares + 1) / (poolAssets + 1)
-withdraw:  assets = burn   · (poolAssets  + 1) / (totalShares + 1)   // floored
-sharePrice = (poolAssets + 1) · WAD / (totalShares + 1)              // vaultOf view
+mtmValue   = poolAssets − netUnrealizedTraderPnL          // see "Marked-to-market NAV"
+deposit:   shares = assets · (totalShares + 1) / (mtmValue + 1)
+withdraw:  assets = burn   · (mtmValue  + 1) / (totalShares + 1)   // + liquidity check
+sharePrice = (mtmValue + 1) · WAD / (totalShares + 1)             // vaultOf view
 ```
 
-Both directions round in the vault's favor (mint floors shares in, redeem floors
-assets out), and the **`+1 / +1` virtual offset** neutralizes the classic
-first-depositor inflation attack: on an empty vault the first deposit mints
-proportionally rather than one wei of shares that could then be revalued by a
-donation. The floored redemption also means `assets ≤ poolAssets` for any single
-withdrawal, so a redeem can never underflow the pool.
+The **`+1 / +1` virtual offset** neutralizes the classic first-depositor inflation
+attack: on an empty vault the first deposit mints proportionally rather than one
+wei of shares that could then be revalued by a donation.
 
-There is no separate accrual index. Because every share is a pro-rata claim on
-`poolAssets`, earnings and losses are reflected the instant they hit the pool —
-the NAV **is** the accumulator, so entry timing is fair by construction with no
-per-deposit bookkeeping.
+### Marked-to-market NAV
+
+`poolAssets` is a *settled-cash* figure — it moves only when a position closes,
+is liquidated, or pays a fee. It does **not** reflect the unrealized P&L of
+positions still open, and an open position in profit is a liability the pool will
+pay on close. Pricing entry/exit off raw `poolAssets` is therefore a stale NAV,
+exploitable in **both** directions by a first-mover: when traders are net-up the
+NAV is overstated, so an LP exits at an inflated price (draining the LPs who stay,
+and in the limit stranding the winning traders whose closes then revert
+`Insolvent`); when traders are net-down the NAV is understated, so a depositor
+mints outsized shares and captures the pending recovery. Both are paid for by the
+LPs who hold through the settlements.
+
+So the vault values shares at `mtmValue = poolAssets − netUnrealizedTraderPnL`,
+computed in **O(1)** from per-side running aggregates maintained on every
+open/increase/decrease/close/liquidation (`_openAgg[marketId][isLong]`):
+`sumSize = Σ size`, `sumEntryW = Σ entry·size`, `sumCheckW = Σ checkpoint·size`.
+From those, each side's unrealized effective PnL is reconstructed exactly as
+`_settleSlice` would at the current mark — price PnL `(mark·sumSize − sumEntryW)·notionalScale`
+(sign flipped for shorts) minus own-side funding `(indexNow·sumSize − sumCheckW)·sizeTick/SCALE`
+— and `netUnrealizedTraderPnL` is their sum (traders' profit is the pool's
+liability). Entry and exit both price against `mtmValue`, so neither first-mover
+edge exists: exit redeems the *true* lower value when traders are up, and entry
+mints against the *true* higher value when traders are down.
+
+**Withdrawal liquidity.** When traders are net-*down*, `mtmValue > poolAssets`:
+the shares are worth more than the liquid cash, because the gains are still locked
+in open (losing) positions' collateral and only reach `poolAssets` as those
+positions settle. A redemption that would exceed `poolAssets` reverts
+`InsufficientLiquidity`; the LP withdraws a smaller amount that fits, or waits for
+the positions to settle. (Deposit has no such constraint — it only adds cash.)
+
+**Accepted approximation.** `netUnrealizedTraderPnL` uses *uncapped* unrealized
+loss, but a position cannot actually lose past its collateral — beyond that it is
+liquidatable and gets wiped into `poolAssets`. So `mtmValue` slightly overstates
+the pool's claim on a deeply-underwater, not-yet-liquidated position; the
+liquidation width (`liqWidthPpm`) bounds that window, the same gap-risk the design
+already carries. It also ignores the (non-linear, un-aggregatable) winnings cut,
+which only understates the LPs' share — conservative. The aggregates are bounded
+by the market's OI caps, so `maxOIGross`/`maxOISkew` also bound this exposure.
 
 ## Entry — immediate, at NAV
 
@@ -60,8 +95,10 @@ Exit is two steps, gated by the market's frozen `unstakeSecs`:
    in the pool** — they keep earning fees and keep bearing P&L through the whole
    window. Re-requesting overwrites the prior request and resets the timer.
 2. `withdraw(marketId)`, once `block.timestamp ≥ unlockAt`, burns the requested
-   shares at the **current** NAV and transfers the USDM out. `CooldownActive`
-   before the clock; `NothingStaked` with no request.
+   shares at the **current marked-to-market** NAV and transfers the USDM out.
+   `CooldownActive` before the clock; `NothingStaked` with no request;
+   `InsufficientLiquidity` if the MTM value exceeds the liquid `poolAssets` (wait
+   for open positions to settle — see "Marked-to-market NAV").
 
 The cooldown is pure exit friction — it exists so a lender cannot pull capital
 opportunistically the instant the book takes an adverse position, not to change
