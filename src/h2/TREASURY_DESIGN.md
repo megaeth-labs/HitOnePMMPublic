@@ -70,9 +70,58 @@ loss, but a position cannot actually lose past its collateral — beyond that it
 liquidatable and gets wiped into `poolAssets`. So `mtmValue` slightly overstates
 the pool's claim on a deeply-underwater, not-yet-liquidated position; the
 liquidation width (`liqWidthPpm`) bounds that window, the same gap-risk the design
-already carries. It also ignores the (non-linear, un-aggregatable) winnings cut,
-which only understates the LPs' share — conservative. The aggregates are bounded
-by the market's OI caps, so `maxOIGross`/`maxOISkew` also bound this exposure.
+already carries.
+
+`netUnrealizedTraderPnL` is also **gross on fees**: it is the raw trader PnL, so it
+ignores both the winnings cut (which the pool *keeps* on a win, so the win side
+*understates* the LPs' share) and the oracle rake (which the operator skims from
+*every* pool gain in `_credit`, including a trader's realized loss, so the loss
+side *overstates* it — the pool only nets `loss − rake`). These point opposite
+ways and partially cancel in a mixed book. Neither is fixable in O(1): the
+per-side aggregate nets winning and losing positions together and the cut is
+non-linear per position, so applying the per-outcome cut/rake would require
+iterating every position — defeating the O(1) NAV. The residual is bounded (≤ the
+open wins' `cut + rake` one way, ≤ `rakePpm · open losses` the other). Its effect
+on LP pricing (stated for auditors): the NAV can sit marginally above or below the
+settlement-consistent value, so a withdrawing LP may receive slightly more than
+their settlement share and a depositor slightly fewer shares. The aggregates are
+bounded by the market's OI caps, so `maxOIGross`/`maxOISkew` also bound this
+exposure.
+
+### Pricing through a primary outage
+
+The NAV above is marked at the primary feed's mark. LPs are **not** time-sensitive
+(unlike traders, who have the self-service and fallback execution paths), so a
+stale primary does not block them — but it must not let them transact at a mark
+nobody is maintaining. So `deposit`/`withdraw` pick the pricing source
+(`_lpNav`):
+
+- **Primary fresh** → the normal `mtmValue` above, unchanged.
+- **Primary stale, fallback fresh** → price off the fallback at an **LP-adverse
+  band edge**. The fallback price is bracketed by the market's `fbCloseSpreadPpm`
+  (`markLow = fb·(1−band)`, `markHigh = fb·(1+band)`), the MTM is evaluated at
+  **both** edges, and the adverse one is taken: a **withdraw** redeems at
+  `min(navLow, navHigh)`, a **deposit** mints at `max(navLow, navHigh)` (so it gets
+  *fewer* shares). Evaluating both edges removes any need to reason about the sign
+  of net OI, and the band means an LP transacting during the outage can never
+  extract value from the uncertainty in the un-maintained price — the house (the
+  staying LPs) always keeps the spread. The funding term is projected from the
+  primary feed's last index/rate (the fallback carries none) at the fallback price
+  as mark reference; `outstanding` is subtracted and the result clamped ≥ 0 as
+  usual.
+- **Both stale** → `revert NoFreshPrice`; the LP simply waits.
+
+`claimWinnings` needs no mark and is **exempt** — a stranded winner can claim as
+the pool refills through any outage. `vaultOf` stays a non-reverting view: it
+reports the primary-mark `mtmValue` plus a `stale` flag so a UI can surface that
+live entry/exit would price off the fallback band.
+
+> One accepted sharp edge: across a *prolonged* outage the projected funding term
+> grows with `now − lastPushMs` at the last-known rate (the same uncapped-funding
+> approximation as above, just over a longer gap), and the adverse-band min/max
+> bounds only the *price*-PnL uncertainty, not that funding drift. Keep
+> `primaryStaleSecs` and `fallbackMaxAge` short so the window an LP can transact in
+> stays close to a maintained price.
 
 ## Entry — immediate, at NAV
 
@@ -97,8 +146,9 @@ Exit is two steps, gated by the market's frozen `unstakeSecs`:
 2. `withdraw(marketId)`, once `block.timestamp ≥ unlockAt`, burns the requested
    shares at the **current marked-to-market** NAV and transfers the USDM out.
    `CooldownActive` before the clock; `NothingStaked` with no request;
-   `InsufficientLiquidity` if the MTM value exceeds the liquid `poolAssets` (wait
-   for open positions to settle — see "Marked-to-market NAV").
+   `InsufficientLiquidity` if the redemption exceeds the liquid pool **net of the
+   senior owed reservation** (`poolAssets − outstanding`; wait for open positions
+   to settle — see "Marked-to-market NAV" and "Owed winnings").
 
 The cooldown is pure exit friction — it exists so a lender cannot pull capital
 opportunistically the instant the book takes an adverse position, not to change
@@ -171,14 +221,77 @@ plus `_drainPool`:
   (open/close fees, the winnings cut, trader losses, liquidation wipes). It skims
   the rake, splits out any builder share (order-driven credits only), and adds the
   remainder to `poolAssets`, lifting the share price for lenders.
-- **`_drainPool`** — a trader win leaves here. It reverts `Insolvent` if
-  `poolAssets` cannot cover the payout, and otherwise subtracts it. **Opens are
-  never solvency-gated** — only payouts are — so a market can always take new risk;
-  it just cannot pay out more than it holds.
+- **`_drainPool`** — a trader win leaves here. The settlement caps the draw at
+  `_drainable` (`poolAssets` minus the senior owed reservation — see "Owed
+  winnings"); anything beyond that is paid as the pool refills, never reverted, so
+  **a winner is never stranded by an empty pool**. **Opens are never
+  solvency-gated** — only payouts are — so a market can always take new risk.
 
 A loss is a **pure NAV markdown** borne pro-rata by every share. There is no
 haircut mechanism, no first-loss tranche, and no waterfall: `poolAssets` simply
 falls, and the share price with it.
+
+## Owed winnings — graceful degradation when the pool can't fully pay
+
+A winning close is funded from `poolAssets`. If the book is momentarily thin —
+traders net-up faster than fees and losses refill it — the pool may not hold the
+full win at that instant. Rather than revert (stranding the winner until some
+unrelated flow tops the pool up), the close **pays what is liquid now and records
+the rest as owed**, claimable as the pool refills. The owed is a senior,
+non-interest-bearing claim, tracked **per market**.
+
+**FIFO by a cumulative frontier (no race).** Each market keeps two monotonic
+counters: `owedTail` (total ever enqueued) and `owedHead` (total ever paid);
+`outstanding = owedTail − owedHead`. An enqueued entry stores `start = owedTail`
+at enqueue time plus its `amount`. The pool's funded frontier is
+
+```
+headFundable = min(owedTail, owedHead + poolAssets)
+entryClaimable(e) = clamp(headFundable − e.start, 0, e.amount) − e.claimed
+```
+
+An entry is fundable only once the frontier passes its `start`, i.e. once the
+pool has covered **everything enqueued before it**. Claim *order* is therefore
+irrelevant — a later entry can never draw funding an earlier one is entitled to,
+whoever calls `claimWinnings` first. A claim moves `owedHead` and `poolAssets`
+**together** by the same amount, so `owedHead + poolAssets` is invariant and a
+claim never retroactively unfunds another entry. `claimWinnings(marketId,
+entryId)` is owner-only (`NotOwed`), pays `entryClaimable`, and may be called
+repeatedly.
+
+**Senior to LPs.** `outstanding` is an unfunded claim on `poolAssets` that ranks
+ahead of every share:
+
+- `_mtmValue` subtracts it, so NAV = `poolAssets − outstanding − net open effPnl`;
+- `withdraw` reserves it (`reservable = poolAssets − outstanding`), so an LP can
+  only ever pull the pool *above* the owed;
+- a fresh winning draw is capped at `_drainable = poolAssets − outstanding`, so a
+  new winner is funded *after* everyone already in the queue.
+
+It is **not** balance-backed: the conservation identity stays
+`usdm.balanceOf(market) == poolAssets + rakeOwed + builderOwed + Σcol`;
+`outstanding` is a lien on future `poolAssets`, not cash held aside.
+
+**Funded-only credit-as-collateral.** When a user who is owed opens or increases a
+position, the collateral is drawn from their **claimable (funded)** owed first and
+only the remainder is pulled from the wallet (`_drawOwedForCollateral`, bounded to
+`MAX_OWED_DRAW` of their entries). This is exactly claim-then-use netted: unfunded
+owed contributes nothing, so **a position never opens on an IOU the pool can't
+back** — consistent with opens being ungated only because they move real cash.
+
+**Fee policy on a shortfall — waive, don't defer.** The fees on a close (the
+winnings cut + the close fee) are carved from the gross win, so they can only be
+*realized* to the extent the pool actually funds that win. On a partial pay the
+settlement charges `feesCharged = min(cut + closeFee, drained)` and **waives the
+rest**: the operator forgoes rake on cash the illiquid pool never funded, and the
+builder share is dropped. The trader is still made whole on their **net**
+entitlement (`col + effPnl − cut − closeFee`) across the immediate payout plus the
+owed — only the house's take on the unfunded portion is given up. This keeps the
+settlement conservation-exact with no phantom pool credit and no payout underflow;
+the alternative (crediting full fees against a partial drain) would either
+over-credit the pool or pay a high-leverage winner less than their collateral. In
+the common fully-liquid case (`drainable ≥ win`) the economics are unchanged:
+gross drain, full fees, no owed.
 
 ## The risk this design accepts (state plainly to lenders)
 

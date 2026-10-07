@@ -139,7 +139,10 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         if (collAfterFee > type(uint128).max) revert BadSize();
         if (notional > type(uint128).max) revert BadSize();
 
-        usdm.safeTransferFrom(order.user, address(this), collateral_);
+        // Fund collateral from the user's funded owed winnings first (claim-then-use, netted), then
+        // pull only the remainder from the wallet — a position never opens on an unfunded IOU.
+        uint256 drawn = _drawOwedForCollateral(marketId, order.user, collateral_);
+        if (collateral_ > drawn) usdm.safeTransferFrom(order.user, address(this), collateral_ - drawn);
         // Open fee to the vault (post oracle-rake and any builder share); credited under the
         // now-known `id` so a builder accrual can name the position.
         if (fee > 0) _creditWithBuilder(marketId, fee, order.builder, order.builderFeePpm, id, true);
@@ -235,7 +238,9 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
             unchecked { addColAfterFee -= fee; }
         }
 
-        usdm.safeTransferFrom(order.user, address(this), addCollateral);
+        // Draw funded owed winnings before the wallet pull (see `_openPosition`).
+        uint256 drawn = _drawOwedForCollateral(marketId, order.user, addCollateral);
+        if (addCollateral > drawn) usdm.safeTransferFrom(order.user, address(this), addCollateral - drawn);
         if (fee > 0) _creditWithBuilder(marketId, fee, order.builder, order.builderFeePpm, id, true);
 
         int128 fundingNow = _indexNow(feed, order.isLong);
@@ -362,15 +367,15 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         RiskParams storage r = _risk[marketId];
 
         int128 fundingNow = _indexNow(feed, pos.isLong);
-        (int256 pnl, int256 fundingPaid, uint256 payout, uint256 cut) =
+        (int256 pnl, int256 fundingPaid, uint256 payoutPreFee, uint256 cut) =
             _settleSlice(pos, pos.size, uint256(pos.col), closeUnits, fundingNow, r, _fees[marketId]);
 
-        uint256 closeFee = 0;
-        if (chargeCloseFee) {
-            (payout, closeFee) = _chargeCloseFee(marketId, closeUnits, pos.size, payout, b, id);
-        }
-
-        _applyTreasuryDelta(marketId, uint256(pos.col), pnl, fundingPaid, cut, b, id);
+        uint256 closeFee = chargeCloseFee ? _closeFeeAmount(marketId, closeUnits, pos.size, payoutPreFee) : 0;
+        // Settle against the pool: drains the win (partial-pay + enqueue owed when illiquid), books
+        // the loss, routes the fees, and returns the payout to transfer now.
+        uint256 payout = _applyTreasuryDelta(
+            marketId, uint256(pos.col), pnl, fundingPaid, cut, closeFee, payoutPreFee, b, id, pos.user
+        );
         _decreaseOI(marketId, pos.isLong, uint256(pos.notionalAtOpen));
         // MTM aggregates: the whole position leaves.
         _openAggSub(marketId, pos.isLong, pos.size, pos.entryPrice, pos.fundingCheckpoint);
@@ -401,15 +406,13 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         int128 fundingNow = _indexNow(feed, pos.isLong);
         uint256 colPortion = uint256(pos.col) * closeSizeUnits / pos.size;
 
-        (int256 pnl, int256 fundingPaid, uint256 payout, uint256 cut) =
+        (int256 pnl, int256 fundingPaid, uint256 payoutPreFee, uint256 cut) =
             _settleSlice(pos, closeSizeUnits, colPortion, closeUnits, fundingNow, r, _fees[marketId]);
 
-        // Capture the CHARGED close fee (min(fee, pre-fee payout)) directly — consistent with
-        // _settleClose, and it drops the recompute's locals that pushed this over the stack limit.
-        uint256 closeFee;
-        (payout, closeFee) = _chargeCloseFee(marketId, closeUnits, closeSizeUnits, payout, b, id);
-
-        _applyTreasuryDelta(marketId, colPortion, pnl, fundingPaid, cut, b, id);
+        uint256 closeFee = _closeFeeAmount(marketId, closeUnits, closeSizeUnits, payoutPreFee);
+        uint256 payout = _applyTreasuryDelta(
+            marketId, colPortion, pnl, fundingPaid, cut, closeFee, payoutPreFee, b, id, pos.user
+        );
 
         uint256 notionalPortion = uint256(pos.notionalAtOpen) * closeSizeUnits / pos.size;
         _decreaseOI(marketId, pos.isLong, notionalPortion);
@@ -431,23 +434,18 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         if (payout > 0) usdm.safeTransfer(user, payout);
     }
 
-    /// @dev Charge the close-fee curve on the closed notional, bounded by what is actually
-    /// leaving (a fee can never exceed the payout it is charged against). The charged
-    /// amount is treasury revenue.
-    function _chargeCloseFee(
-        uint256 marketId, uint128 closeUnits, uint128 closeSizeUnits, uint256 payout,
-        BuilderRef memory b, uint256 positionId
-    )
-        internal returns (uint256 newPayout, uint256 charged)
+    /// @dev The close-fee curve on the closed notional, bounded by the pre-fee payout (a fee can
+    /// never exceed what is leaving). PURE amount — crediting is deferred to `_applyTreasuryDelta`
+    /// so the partial-pay path can waive the share an illiquid pool never realizes.
+    function _closeFeeAmount(uint256 marketId, uint128 closeUnits, uint128 closeSizeUnits, uint256 payoutPreFee)
+        internal view returns (uint256 charged)
     {
         RiskParams storage r = _risk[marketId];
         FeeParams  storage f = _fees[marketId];
         uint256 closeNotional = _notional(closeUnits, closeSizeUnits, r.notionalScale);
         uint256 feePpm = ParamCatalog.sizeFeePpm(closeNotional, _usdmDenom, f.closeFlatPpm, f.closeLinearScale, f.closeQuadScale);
         uint256 fee = closeNotional * feePpm / PPM;
-        charged = fee < payout ? fee : payout;
-        if (charged > 0) _creditWithBuilder(marketId, charged, b.builder, b.feePpm, positionId, false);
-        newPayout = payout - charged;
+        charged = fee < payoutPreFee ? fee : payoutPreFee;
     }
 
     function _wipePosition(uint256 id, uint128 markAtLiqUnits, uint16 ringStep) internal {
@@ -466,24 +464,58 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         emit PositionLiquidated(id, _priceOut(markAtLiqUnits, _risk[marketId].priceTick), ringStep, wiped);
     }
 
-    /// @dev Route a settlement's PnL through the lending pool. `effPnl > 0` drains the pool
-    /// and credits the cut back; `effPnl < 0` credits the loss (capped at the slice's
-    /// collateral).
+    /// @dev Route a settlement's PnL through the lending pool and return the payout to transfer
+    /// now. `payoutPreFee` is the slice's payout before the close fee (`_settleSlice`), so the net
+    /// entitlement is `payoutPreFee − closeFee`.
+    ///
+    /// A LOSS credits the pool (capped at the slice collateral) and routes the close fee. A WIN
+    /// drains the pool for the trader's gross win and routes the cut + close fee — but only to the
+    /// extent the pool (RESERVING senior owed) can fund it:
+    ///  - solvent (`avail ≥ win`): exact existing economics — drain the gross, route both fees;
+    ///  - partial (`avail < win`, `win > fees`): pay what's liquid, charge only the fee the drain
+    ///    realizes (the rest is WAIVED — no rake on cash the pool never funded), and enqueue the
+    ///    shortfall as owed, senior to LPs and FIFO (see TREASURY_DESIGN.md);
+    ///  - win fully eaten by fees (`win ≤ fees`): the pool GAINS from collateral, so there is never
+    ///    a liquidity problem — book the gain, pay the net, no owed.
     function _applyTreasuryDelta(
         uint256 marketId, uint256 posCol, int256 pnl, int256 fundingPaid, uint256 cut,
-        BuilderRef memory b, uint256 positionId
+        uint256 closeFee, uint256 payoutPreFee, BuilderRef memory b, uint256 positionId, address user
     )
-        internal
+        internal returns (uint256 payout)
     {
         int256 effPnl = pnl - fundingPaid;
+        uint256 payoutNet = payoutPreFee - closeFee; // the trader's full net entitlement (≥ 0)
         if (effPnl > 0) {
-            _drainPool(marketId, uint256(effPnl));
-            // The winnings cut is a fee the builder shares in (isOpenSide = false: it's a close).
-            if (cut > 0) _creditWithBuilder(marketId, cut, b.builder, b.feePpm, positionId, false);
-        } else if (effPnl < 0) {
-            uint256 loss = uint256(-effPnl);
-            if (loss > posCol) loss = posCol;
-            if (loss > 0) _credit(marketId, loss); // a loss is not a fee — no builder share
+            uint256 win   = uint256(effPnl);
+            uint256 fees  = cut + closeFee;
+            uint256 avail = _drainable(marketId);    // poolAssets − outstanding, floored at 0
+            if (avail >= win) {
+                _drainPool(marketId, win);
+                // The cut + close fee are fees the builder shares in (isOpenSide = false: a close).
+                if (cut > 0)      _creditWithBuilder(marketId, cut, b.builder, b.feePpm, positionId, false);
+                if (closeFee > 0) _creditWithBuilder(marketId, closeFee, b.builder, b.feePpm, positionId, false);
+                payout = payoutNet;
+            } else if (win > fees) {
+                _drainPool(marketId, avail);
+                uint256 feesCharged = fees < avail ? fees : avail; // waive the part the drain can't back
+                if (feesCharged > 0) _credit(marketId, feesCharged);
+                payout = posCol + avail - feesCharged;             // ≥ posCol
+                uint256 owed = payoutNet - payout;                 // > 0
+                uint256 entryId = _enqueueOwed(marketId, user, owed);
+                emit WinningsOwed(marketId, user, entryId, owed);
+            } else {
+                uint256 gain = fees - win;                         // = posCol − payoutNet; pool gains
+                if (gain > 0) _credit(marketId, gain);
+                payout = payoutNet;
+            }
+        } else {
+            if (effPnl < 0) {
+                uint256 loss = uint256(-effPnl);
+                if (loss > posCol) loss = posCol;
+                if (loss > 0) _credit(marketId, loss); // a loss is not a fee — no builder share
+            }
+            if (closeFee > 0) _creditWithBuilder(marketId, closeFee, b.builder, b.feePpm, positionId, false);
+            payout = payoutNet;
         }
     }
 

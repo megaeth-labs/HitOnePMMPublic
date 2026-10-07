@@ -196,19 +196,6 @@ abstract contract H2Markets is H2Storage {
         );
     }
 
-    /// @dev The fallback feed's price (1e18) and freshness, per the market's params.
-    /// Rejects non-positive and future-stamped answers outright.
-    function _fallbackRead(OracleParams storage o)
-        internal view returns (uint256 price1e18, bool fresh)
-    {
-        (, int256 answer,, uint256 updatedAt,) = IAggregatorV3(o.fallbackFeed).latestRoundData();
-        if (answer <= 0) revert OracleBadAnswer();
-        uint256 upd = _updatedAtSecs(updatedAt);
-        if (upd > block.timestamp + 60) revert OracleBadAnswer(); // future-stamped
-        price1e18 = uint256(answer) * (10 ** (18 - uint256(o.fallbackDecimals)));
-        fresh = block.timestamp <= upd + uint256(o.fallbackMaxAge);
-    }
-
     /// @dev THE CONVERGENCE CHECK: require the primary mark and the fallback to agree
     /// within `maxDeviationPpm` — a fresh fallback that disagrees blocks the action rather
     /// than letting either price win. Publications are ungated (the oracle doesn't know
@@ -233,14 +220,4 @@ abstract contract H2Markets is H2Storage {
         if (diff * PPM > uint256(o.maxDeviationPpm) * fb) revert DeviationGate();
     }
 
-    /// @dev Primary feed staleness on the HP clock — the fallback path's arming test.
-    /// A never-published feed does NOT arm: no position can exist on it (both execution
-    /// paths refuse), and arming it would let positions exist against a zero mark.
-    function _primaryStale(uint256 marketId, IH2Oracle.FeedView memory feed)
-        internal view returns (bool)
-    {
-        if (feed.lastPushMs == 0) return false;
-        uint64 nowMs = uint64(_microTimestamp() / 1000);
-        return nowMs - feed.lastPushMs > uint64(_oracles[marketId].primaryStaleSecs) * 1000;
-    }
 }

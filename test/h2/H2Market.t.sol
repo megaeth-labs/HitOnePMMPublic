@@ -708,6 +708,7 @@ contract H2MarketTest is Test {
         h.withdraw(mkt);
 
         _adv(TERM);
+        _pushMark(50_000e18, 0, 0, 0); // operator keeps the feed fresh through the cooldown
         uint256 bal0 = usdm.balanceOf(carl);
         vm.prank(carl);
         uint256 got = h.withdraw(mkt);
@@ -723,6 +724,7 @@ contract H2MarketTest is Test {
         // A round trip lands DURING the cooldown; the unstaking shares still capture the fees.
         _roundTrip();
         _adv(TERM);
+        _pushMark(50_000e18, 0, 0, 0); // operator keeps the feed fresh through the cooldown
         vm.prank(carl);
         uint256 got = h.withdraw(mkt);
         assertGt(got, 5_000_000e18, "cooldown shares earned the interim fees - no dodge");
@@ -743,6 +745,7 @@ contract H2MarketTest is Test {
         vm.prank(carl);
         h.requestUnstake(mkt, shares);
         _adv(TERM);
+        _pushMark(51_000e18, 0, 0, 0); // operator keeps the feed fresh through the cooldown
         uint256 bal0 = usdm.balanceOf(carl);
         vm.prank(carl);
         uint256 got = h.withdraw(mkt);
@@ -1239,6 +1242,7 @@ contract H2MarketTest is Test {
         uint256 shares = h.stakeOf(mkt, carl).shares;
         vm.prank(carl); h.requestUnstake(mkt, shares);
         _adv(uint256(TERM) + 1);
+        _pushMark(51_000e18, 0, 0, 0); // operator keeps the feed fresh through the cooldown
         vm.prank(carl);
         uint256 got = h.withdraw(mkt);
         assertLt(got, pa, "redeemed at mtm, not the stale overstated poolAssets");
@@ -1277,6 +1281,7 @@ contract H2MarketTest is Test {
         uint256 shares = h.stakeOf(mkt, carl).shares;
         vm.prank(carl); h.requestUnstake(mkt, shares);
         _adv(uint256(TERM) + 1);
+        _pushMark(49_900e18, 0, 0, 0); // operator keeps the feed fresh; the illiquidity is the point
         vm.prank(carl);
         vm.expectRevert(IH2Market.InsufficientLiquidity.selector);
         h.withdraw(mkt);
@@ -1289,6 +1294,310 @@ contract H2MarketTest is Test {
         vm.prank(carl);
         uint256 got = h.withdraw(mkt);
         assertGt(got, 0, "withdraw succeeds after settlement");
+    }
+
+    // ============================================================
+    // owed winnings (a winning close the pool couldn't fully pay)
+    // ============================================================
+
+    /// @dev Zero fee + zero cut so owed math is exact: payoutNet = col + effPnl, owed = win − avail.
+    function _feesZero() internal pure returns (IH2Market.FeeParams memory) {
+        return IH2Market.FeeParams({
+            openFlatPpm: 0, openLinearScale: 0, openQuadScale: 0,
+            closeFlatPpm: 0, closeLinearScale: 0, closeQuadScale: 0,
+            cutInterceptPpm: 0, cutSlopePpm: 0, maxCutPpm: 0,
+            maxBuilderFeePpm: 0
+        });
+    }
+
+    function _mkMarket(IH2Market.FeeParams memory fp) internal returns (uint256 m) {
+        vm.prank(op);
+        m = h.createMarket(token, fp, _risk(0), _oracleParams(), _spread(), address(reg));
+    }
+
+    function _orderOn(uint256 m, uint256 pk, bool isLong, bool isOpen, uint256 size, uint256 lev,
+                      uint256 target, uint256 nonce)
+        internal view returns (IH2Market.Order memory)
+    {
+        return IH2Market.Order({
+            user: vm.addr(pk), marketId: m, isLong: isLong, isOpen: isOpen,
+            size: size, leverage: lev, targetPrice: target, maxSlippageBps: 2000,
+            deadline: uint64(block.timestamp + 1 hours), channel: 0, nonce: nonce,
+            builder: address(0), builderFeePpm: 0
+        });
+    }
+
+    function _pushOrderOn(uint256 m, uint256 mark, IH2Market.Order memory o, bytes memory sig) internal {
+        _refresh(mark);
+        bytes memory data = abi.encode(m, uint8(IH2Market.ActionKind.Order_), abi.encode(o, sig));
+        IH2Oracle.Call[] memory calls = new IH2Oracle.Call[](1);
+        calls[0] = IH2Oracle.Call({ target: address(h), data: data });
+        vm.prank(op);
+        oracle.pushWithParams(feedId, mark, 0, 0, 0, int32(0), calls);
+    }
+
+    function _openLongOn(uint256 m, uint256 pk, uint256 size, uint256 lev, uint256 mark, uint256 nonce)
+        internal returns (uint256 id)
+    {
+        _adv(1);
+        IH2Market.Order memory o = _orderOn(m, pk, true, true, size, lev, mark, nonce);
+        _pushOrderOn(m, mark, o, _sign(pk, o));
+        id = h.activePositionId(vm.addr(pk), m);
+    }
+
+    function _closeAllOn(uint256 m, uint256 pk, uint256 mark, uint256 nonce) internal {
+        _adv(1);
+        IH2Market.PositionView memory p = h.positions(h.activePositionId(vm.addr(pk), m));
+        IH2Market.Order memory c = _orderOn(m, pk, p.isLong, false, p.size, 0, mark, nonce);
+        _pushOrderOn(m, mark, c, _sign(pk, c));
+    }
+
+    /// @dev Assert a WinningsOwed(market,user,entryId,amount) was emitted by `h` among recorded logs.
+    function _assertWinningsOwed(uint256 m, address user, uint256 entryId, uint256 amount) internal {
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 sig = keccak256("WinningsOwed(uint256,address,uint256,uint256)");
+        bool found;
+        for (uint256 i; i < logs.length; i++) {
+            if (logs[i].emitter != address(h) || logs[i].topics[0] != sig) continue;
+            if (uint256(logs[i].topics[1]) != m) continue;
+            if (address(uint160(uint256(logs[i].topics[2]))) != user) continue;
+            (uint256 eid, uint256 amt) = abi.decode(logs[i].data, (uint256, uint256));
+            assertEq(eid, entryId, "owed entryId"); assertEq(amt, amount, "owed amount");
+            found = true;
+        }
+        assertTrue(found, "WinningsOwed emitted");
+    }
+
+    function _seedOn(uint256 m, address who, uint256 amount) internal {
+        usdm.mint(who, amount);
+        vm.startPrank(who);
+        usdm.approve(address(h), type(uint256).max);
+        h.deposit(m, amount);
+        vm.stopPrank();
+    }
+
+    /// @dev Strand `alice`: a 1000e18-win long closed against a `seed`-sized pool. Returns (market,
+    /// owed). With zero fees: col = 500e18, win = 1000e18, payout = col + seed, owed = win − seed.
+    function _strandAliceWinner(uint256 seed, uint256 nonceBase) internal returns (uint256 m, uint256 owed) {
+        m = _mkMarket(_feesZero());
+        _adv(1); _pushMark(50_000e18, 0, 0, 0);
+        _seedOn(m, carl, seed);
+        _openLongOn(m, alicePk, 1e18, 100, 50_000e18, nonceBase);
+        _closeAllOn(m, alicePk, 51_000e18, nonceBase + 1);
+        owed = 1000e18 - seed; // win − avail (avail == seed; no fees to shift it)
+    }
+
+    /// Stranded winner: the close does NOT revert, pays what's liquid (col + pool), and enqueues the
+    /// rest as owed — senior to LPs, FIFO. Cash leaving the contract equals the payout (conservation).
+    function test_owed_strandedWinnerPaysPartialAndEnqueues() public {
+        uint256 m = _mkMarket(_feesZero());
+        _adv(1); _pushMark(50_000e18, 0, 0, 0);
+        _seedOn(m, carl, 300e18);
+        _openLongOn(m, alicePk, 1e18, 100, 50_000e18, 0);
+
+        uint256 hBefore = usdm.balanceOf(address(h));
+        uint256 aBefore = usdm.balanceOf(alice);
+
+        vm.recordLogs();
+        _closeAllOn(m, alicePk, 51_000e18, 1);
+        _assertWinningsOwed(m, alice, 0, 700e18);
+
+        assertEq(h.owedOf(m), 700e18, "shortfall enqueued (win 1000 - pool 300)");
+        assertEq(usdm.balanceOf(alice) - aBefore, 800e18, "paid col 500 + liquid pool 300");
+        assertEq(hBefore - usdm.balanceOf(address(h)), 800e18, "only the payout left the contract");
+        assertEq(h.vaultOf(m).poolAssets, 0, "pool fully drained to its reservation");
+        (, uint256 amt, uint256 claimed, uint256 claimable) = h.owedEntry(m, 0);
+        assertEq(amt, 700e18); assertEq(claimed, 0); assertEq(claimable, 0, "nothing fundable yet");
+    }
+
+    /// FIFO, no race: a later owed entry cannot claim ahead of an earlier one, whoever calls first.
+    function test_owed_fifoNoRace() public {
+        uint256 m = _mkMarket(_feesZero());
+        _adv(1); _pushMark(50_000e18, 0, 0, 0);
+        _seedOn(m, carl, 300e18);
+        _openLongOn(m, alicePk, 1e18, 100, 50_000e18, 0); // entry 0 (alice) enqueues first
+        _openLongOn(m, bobPk,   1e18, 100, 50_000e18, 0); // entry 1 (bob) enqueues after
+        _closeAllOn(m, alicePk, 51_000e18, 1);            // alice owed 700 (drains the 300 pool)
+        _closeAllOn(m, bobPk,   51_000e18, 1);            // bob owed 1000 (pool already at reservation)
+
+        assertEq(h.owedOf(m), 1700e18, "both shortfalls queued");
+        _seedOn(m, carl, 400e18); // refill 400 — funds the HEAD (alice), not enough to reach bob
+
+        (, , , uint256 aliceClaimable) = h.owedEntry(m, 0);
+        (, , , uint256 bobClaimable)   = h.owedEntry(m, 1);
+        assertEq(aliceClaimable, 400e18, "head funded first");
+        assertEq(bobClaimable, 0, "junior entry cannot jump the queue");
+
+        vm.prank(bob);
+        vm.expectRevert(IH2Market.ZeroAmount.selector);
+        h.claimWinnings(m, 1); // bob cannot pull alice's funding
+
+        uint256 bal = usdm.balanceOf(alice);
+        vm.prank(alice);
+        assertEq(h.claimWinnings(m, 0), 400e18, "alice claims the funded head");
+        assertEq(usdm.balanceOf(alice) - bal, 400e18);
+        assertEq(h.owedOf(m), 1300e18, "700-400 + bob's 1000 remain");
+    }
+
+    /// A refill lets the owed be claimed in pieces as the pool fills — partial, then the rest.
+    function test_owed_refillThenClaimPartialThenFull() public {
+        (uint256 m, uint256 owed) = _strandAliceWinner(300e18, 0); // owed 700
+        assertEq(owed, 700e18);
+
+        _seedOn(m, carl, 400e18);
+        uint256 b0 = usdm.balanceOf(alice);
+        vm.prank(alice);
+        assertEq(h.claimWinnings(m, 0), 400e18, "claims what the refill funds");
+        assertEq(usdm.balanceOf(alice) - b0, 400e18);
+        assertEq(h.owedOf(m), 300e18);
+
+        _seedOn(m, carl, 300e18); // fund the remainder
+        uint256 b1 = usdm.balanceOf(alice);
+        vm.prank(alice);
+        assertEq(h.claimWinnings(m, 0), 300e18, "claims the rest");
+        assertEq(usdm.balanceOf(alice) - b1, 300e18);
+        assertEq(h.owedOf(m), 0, "fully paid");
+
+        vm.prank(alice);
+        vm.expectRevert(IH2Market.ZeroAmount.selector);
+        h.claimWinnings(m, 0); // nothing left
+    }
+
+    /// Owed is senior to LPs: an LP withdrawal can only drain the pool ABOVE the owed reservation.
+    function test_owed_seniorToLps() public {
+        (uint256 m, ) = _strandAliceWinner(300e18, 0); // owed 700, pool drained to 0
+        _seedOn(m, carl, 1000e18);                     // refill: pool 1000, outstanding 700
+
+        uint256 shares = h.stakeOf(m, carl).shares;
+        vm.prank(carl); h.requestUnstake(m, shares);
+        _adv(uint256(TERM) + 1);
+        _pushMark(51_000e18, 0, 0, 0); // keep primary fresh for the withdraw
+
+        vm.prank(carl);
+        uint256 got = h.withdraw(m);
+        assertApproxEqAbs(got, 300e18, 1, "LP pulls only the pool above the owed reservation");
+        assertApproxEqAbs(h.vaultOf(m).poolAssets, 700e18, 1, "the owed stays backed");
+        assertEq(h.owedOf(m), 700e18, "alice's senior claim intact");
+    }
+
+    /// Funded-only credit-as-collateral: an open draws the user's CLAIMABLE owed first, then the
+    /// wallet — never an unfunded IOU. A position never opens on credit the pool can't back.
+    function test_owed_fundedCreditAsCollateral() public {
+        (uint256 m, ) = _strandAliceWinner(300e18, 0); // alice owed 700 (entry 0), pool 0
+        _seedOn(m, carl, 400e18);                      // fund 400 of alice's owed
+
+        uint256 wallet0 = usdm.balanceOf(alice);
+        uint256 id = _openLongOn(m, alicePk, 1e18, 100, 50_000e18, 2); // needs col 500e18
+
+        assertEq(h.positions(id).col, 500e18, "collateral assembled");
+        assertEq(wallet0 - usdm.balanceOf(alice), 100e18, "only the 100 remainder pulled from the wallet");
+        (, , uint256 claimed, ) = h.owedEntry(m, 0);
+        assertEq(claimed, 400e18, "the funded owed was drawn into collateral");
+        assertEq(h.owedOf(m), 300e18, "unfunded remainder still owed");
+        assertEq(h.vaultOf(m).poolAssets, 0, "drawn owed left the pool as collateral");
+    }
+
+    /// Waive on deep insolvency (drainable < fees): the trader is paid down to their collateral, the
+    /// unrealized fees are NOT credited (operator forgoes rake on cash the pool never funded), and
+    /// conservation holds — cash leaving equals the payout.
+    function test_owed_waiveFeesWhenDrainBelowFees() public {
+        uint256 m = _mkMarket(_fees()); // real fees + cut
+        _adv(1); _pushMark(50_000e18, 0, 0, 0);
+        _seedOn(m, carl, 10e18);        // tiny pool: drainable ≪ the close's fees
+        uint256 id = _openLongOn(m, alicePk, 1e18, 100, 50_000e18, 0);
+        uint256 col = h.positions(id).col; // col after the open fee
+
+        uint256 hBefore = usdm.balanceOf(address(h));
+        uint256 aBefore = usdm.balanceOf(alice);
+        _closeAllOn(m, alicePk, 60_000e18, 1); // huge win; pool can't fund even the fees
+
+        uint256 paid = usdm.balanceOf(alice) - aBefore;
+        assertEq(paid, col, "paid exactly the collateral - fees above the drain are waived");
+        assertEq(hBefore - usdm.balanceOf(address(h)), paid, "only the payout left (conservation)");
+        assertGt(h.owedOf(m), 0, "the rest is owed");
+    }
+
+    // ============================================================
+    // LP pricing through a primary outage (fallback adverse band)
+    // ============================================================
+
+    /// @dev Primary goes stale (no push past primaryStaleSecs=300s) while the fallback is refreshed.
+    function _primaryStaleFallbackFresh(uint256 fbPrice1e18) internal {
+        _adv(400);
+        fallbackFeed.setAnswer(int256(fbPrice1e18 / 1e10));
+        fallbackFeed.setUpdatedAt(block.timestamp);
+    }
+
+    /// Primary fresh ⇒ the normal regime: LP NAV is the primary-mark MTM, stale flag false.
+    function test_lpPricing_freshPrimaryUsesNormalNav() public {
+        _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(1); _pushMark(50_000e18, 0, 0, 0);
+        (uint256 depNav, bool s1) = h.lpNav(mkt, false);
+        (uint256 wdNav,  bool s2) = h.lpNav(mkt, true);
+        assertEq(depNav, h.mtm(mkt), "deposit NAV == primary MTM");
+        assertEq(wdNav,  h.mtm(mkt), "withdraw NAV == primary MTM");
+        assertFalse(s1); assertFalse(s2);
+        assertFalse(h.vaultOf(mkt).stale, "not stale");
+    }
+
+    /// Primary stale + fallback fresh: deposit prices at the HIGH adverse edge (fewer shares),
+    /// withdraw at the LOW edge (less out), and the edges span the fbCloseSpread band. vaultOf flags
+    /// the regime. A 1e18 long: ±0.2% of 50_000 = ±100 price ⇒ ±100e18 price PnL.
+    function test_lpPricing_staleFallbackAdverseBand() public {
+        _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        uint256 flat = h.mtm(mkt); // primary mark still 50_000 ⇒ alice flat ⇒ NAV == poolAssets
+        _primaryStaleFallbackFresh(50_000e18);
+
+        assertTrue(h.vaultOf(mkt).stale, "vaultOf surfaces the stale regime");
+        (uint256 depNav, bool s1) = h.lpNav(mkt, false);
+        (uint256 wdNav,  bool s2) = h.lpNav(mkt, true);
+        assertTrue(s1 && s2, "stale");
+        assertEq(depNav, flat + 100e18, "deposit at the high edge (long +PnL, pool owes more)");
+        assertEq(wdNav,  flat - 100e18, "withdraw at the low edge");
+        assertGt(depNav, flat); assertLt(wdNav, flat);
+        assertEq(depNav - wdNav, 200e18, "edges span the fbCloseSpread band (2000 ppm on 1e18 long)");
+
+        // A real deposit mints FEWER shares than the flat-fallback NAV would.
+        uint256 ts = h.vaultOf(mkt).totalShares;
+        usdm.mint(bob, 1_000e18);
+        vm.prank(bob); uint256 shares = h.deposit(mkt, 1_000e18);
+        assertLt(shares, 1_000e18 * (ts + 1) / (flat + 1), "adverse-high NAV mints fewer shares");
+    }
+
+    /// Both sources stale ⇒ LPs wait: deposit and withdraw revert NoFreshPrice. claimWinnings does not.
+    function test_lpPricing_bothStaleRevertsNoFreshPrice() public {
+        _openLong(alicePk, 1e18, 100, 50_000e18, 0);
+        _adv(400); // no primary push, no fallback refresh ⇒ both stale
+
+        usdm.mint(bob, 1_000e18);
+        vm.prank(bob);
+        vm.expectRevert(IH2Market.NoFreshPrice.selector);
+        h.deposit(mkt, 1_000e18);
+
+        uint256 shares = h.stakeOf(mkt, carl).shares;
+        vm.prank(carl); h.requestUnstake(mkt, shares);
+        _adv(uint256(TERM) + 1); // cooldown elapses, still no fresh price
+        vm.prank(carl);
+        vm.expectRevert(IH2Market.NoFreshPrice.selector);
+        h.withdraw(mkt);
+    }
+
+    /// claimWinnings needs no mark: a stranded winner can still claim during a full price outage.
+    function test_lpPricing_claimWinningsWorksDuringOutage() public {
+        (uint256 m, ) = _strandAliceWinner(300e18, 0); // alice owed 700, pool 0
+        _seedOn(m, carl, 400e18);                      // fund 400 while fresh
+        _adv(400);                                     // both sources go stale
+
+        // Sanity: an LP action on m is blocked now.
+        usdm.mint(bob, 1e18);
+        vm.prank(bob);
+        vm.expectRevert(IH2Market.NoFreshPrice.selector);
+        h.deposit(m, 1e18);
+
+        uint256 b0 = usdm.balanceOf(alice);
+        vm.prank(alice);
+        assertEq(h.claimWinnings(m, 0), 400e18, "winner claims through the outage");
+        assertEq(usdm.balanceOf(alice) - b0, 400e18);
     }
 }
 
@@ -1310,5 +1619,9 @@ contract H2MarketHarness is H2Market {
 
     function mtm(uint256 marketId) external view returns (uint256) {
         return _mtmValue(marketId);
+    }
+
+    function lpNav(uint256 marketId, bool isWithdraw) external view returns (uint256 nav, bool stale) {
+        return _lpNav(marketId, isWithdraw);
     }
 }
