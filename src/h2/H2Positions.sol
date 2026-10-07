@@ -358,6 +358,10 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
                     pos.isLong ? _floorToTick(fb - spread, tick) : _ceilToTick(fb + spread, tick), tick
                 );
             }
+        } else {
+            // Fresh primary: behind the same convergence gate as every other settlement path — a
+            // fresh fallback that disagrees by more than `maxDeviationPpm` blocks expiry too.
+            _assertConvergence(marketId, feed.mark, false);
         }
         // Expiry is a forced event: no close fee, no order → no builder.
         uint256 payout_ = _settleClose(id, markUnits, feed, false, BuilderRef({ builder: address(0), feePpm: 0 }));
