@@ -272,12 +272,14 @@ It is **not** balance-backed: the conservation identity stays
 `usdm.balanceOf(market) == poolAssets + rakeOwed + builderOwed + Σcol`;
 `outstanding` is a lien on future `poolAssets`, not cash held aside.
 
-**Funded-only credit-as-collateral.** When a user who is owed opens or increases a
-position, the collateral is drawn from their **claimable (funded)** owed first and
-only the remainder is pulled from the wallet (`_drawOwedForCollateral`, bounded to
-`MAX_OWED_DRAW` of their entries). This is exactly claim-then-use netted: unfunded
-owed contributes nothing, so **a position never opens on an IOU the pool can't
-back** — consistent with opens being ungated only because they move real cash.
+**Claiming.** Owed is claimed by its owner via `claimWinnings(marketId, entryId)`,
+which pays the funded part of that entry and can be called repeatedly as the pool
+refills. A user discovers their `entryId`s off-chain from the `WinningsOwed` event
+(indexed by `user`); there is no per-user on-chain index. Owed winnings are **not**
+auto-netted into new positions — opening a position always pulls its collateral
+from the wallet, and a user who is owed simply claims first and then opens. (An
+earlier draft netted funded owed into collateral; it was dropped as complexity that
+bought only convenience — `claimWinnings` already recovers every owed wei.)
 
 **Fee policy on a shortfall — waive, don't defer.** The fees on a close (the
 winnings cut + the close fee) are carved from the gross win, so they can only be

@@ -179,17 +179,13 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
         uint128 amount;  // shortfall owed
         uint128 claimed; // paid so far
     }
-    /// @notice Per-market owed queue + the owner's lookup of its entry ids, and the two
-    /// monotonic cumulative counters that make the funded frontier O(1): `owedTail` = Σ ever
-    /// enqueued, `owedHead` = Σ ever paid; `outstanding = owedTail − owedHead`.
+    /// @notice Per-market owed queue plus the two monotonic cumulative counters that make the
+    /// funded frontier O(1): `owedTail` = Σ ever enqueued, `owedHead` = Σ ever paid;
+    /// `outstanding = owedTail − owedHead`. Each entry is claimed by its owner via `claimWinnings`
+    /// (keyed by the `entryId` carried in the `WinningsOwed` event) — there is no per-user index.
     mapping(uint256 => OwedEntry[]) internal _owedQueue;
-    mapping(uint256 => mapping(address => uint256[])) internal _userOwed;
     mapping(uint256 => uint256) internal owedTail;
     mapping(uint256 => uint256) internal owedHead;
-
-    /// @dev Cap on how many of a user's owed entries one open/increase auto-draws as collateral;
-    /// beyond it the remainder comes from the wallet (claim the rest via `claimWinnings`). Gas bound.
-    uint256 internal constant MAX_OWED_DRAW = 8;
 
     constructor(address usdm_, address oracle_) {
         if (usdm_ == address(0) || oracle_ == address(0)) revert ZeroAddress();
@@ -409,7 +405,6 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
         _owedQueue[marketId].push(OwedEntry({
             user: user, start: uint128(owedTail[marketId]), amount: uint128(amount), claimed: 0
         }));
-        _userOwed[marketId][user].push(id);
         owedTail[marketId] += amount;
     }
 

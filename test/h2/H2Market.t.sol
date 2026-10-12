@@ -1480,23 +1480,6 @@ contract H2MarketTest is Test {
         assertEq(h.owedOf(m), 700e18, "alice's senior claim intact");
     }
 
-    /// Funded-only credit-as-collateral: an open draws the user's CLAIMABLE owed first, then the
-    /// wallet — never an unfunded IOU. A position never opens on credit the pool can't back.
-    function test_owed_fundedCreditAsCollateral() public {
-        (uint256 m, ) = _strandAliceWinner(300e18, 0); // alice owed 700 (entry 0), pool 0
-        _seedOn(m, carl, 400e18);                      // fund 400 of alice's owed
-
-        uint256 wallet0 = usdm.balanceOf(alice);
-        uint256 id = _openLongOn(m, alicePk, 1e18, 100, 50_000e18, 2); // needs col 500e18
-
-        assertEq(h.positions(id).col, 500e18, "collateral assembled");
-        assertEq(wallet0 - usdm.balanceOf(alice), 100e18, "only the 100 remainder pulled from the wallet");
-        (, , uint256 claimed, ) = h.owedEntry(m, 0);
-        assertEq(claimed, 400e18, "the funded owed was drawn into collateral");
-        assertEq(h.owedOf(m), 300e18, "unfunded remainder still owed");
-        assertEq(h.vaultOf(m).poolAssets, 0, "drawn owed left the pool as collateral");
-    }
-
     /// Waive on deep insolvency (drainable < fees): the trader is paid down to their collateral, the
     /// unrealized fees are NOT credited (operator forgoes rake on cash the pool never funded), and
     /// conservation holds — cash leaving equals the payout.

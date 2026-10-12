@@ -139,10 +139,9 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
         if (collAfterFee > type(uint128).max) revert BadSize();
         if (notional > type(uint128).max) revert BadSize();
 
-        // Fund collateral from the user's funded owed winnings first (claim-then-use, netted), then
-        // pull only the remainder from the wallet — a position never opens on an unfunded IOU.
-        uint256 drawn = _drawOwedForCollateral(marketId, order.user, collateral_);
-        if (collateral_ > drawn) usdm.safeTransferFrom(order.user, address(this), collateral_ - drawn);
+        // Pull collateral from the wallet. Owed winnings are not auto-netted into a new position;
+        // the user claims them separately via `claimWinnings`.
+        usdm.safeTransferFrom(order.user, address(this), collateral_);
         // Open fee to the vault (post oracle-rake and any builder share); credited under the
         // now-known `id` so a builder accrual can name the position.
         if (fee > 0) _creditWithBuilder(marketId, fee, order.builder, order.builderFeePpm, id, true);
@@ -238,9 +237,7 @@ abstract contract H2Positions is H2Markets, H2Orders, H2Treasury {
             unchecked { addColAfterFee -= fee; }
         }
 
-        // Draw funded owed winnings before the wallet pull (see `_openPosition`).
-        uint256 drawn = _drawOwedForCollateral(marketId, order.user, addCollateral);
-        if (addCollateral > drawn) usdm.safeTransferFrom(order.user, address(this), addCollateral - drawn);
+        usdm.safeTransferFrom(order.user, address(this), addCollateral);
         if (fee > 0) _creditWithBuilder(marketId, fee, order.builder, order.builderFeePpm, id, true);
 
         int128 fundingNow = _indexNow(feed, order.isLong);

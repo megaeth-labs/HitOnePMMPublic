@@ -462,11 +462,10 @@ interface IH2Market {
     function claimWinnings(uint256 marketId, uint256 entryId) external returns (uint256 amount);
     /// @notice Total unpaid owed winnings on a market (senior to LPs).
     function owedOf(uint256 marketId) external view returns (uint256);
-    /// @notice An owed entry's user/amount/claimed plus how much is claimable right now.
+    /// @notice An owed entry's user/amount/claimed plus how much is claimable right now. Discover a
+    /// user's `entryId`s off-chain from the `WinningsOwed(marketId, user, entryId, amount)` event.
     function owedEntry(uint256 marketId, uint256 entryId)
         external view returns (address user, uint256 amount, uint256 claimed, uint256 claimable);
-    /// @notice The entry ids a user is owed on a market.
-    function owedEntriesOf(uint256 marketId, address user) external view returns (uint256[] memory);
 
     /// @notice The caller/builder's accrued, claimable fees (USDM).
     function builderOwed(address builder) external view returns (uint256);

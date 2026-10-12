@@ -155,29 +155,6 @@ abstract contract H2Treasury is H2Storage {
         usdm.safeTransfer(msg.sender, amount);
     }
 
-    /// @dev Draw up to `need` of `user`'s CLAIMABLE owed (FIFO-funded) to fund fresh collateral,
-    /// moving real cash out of `poolAssets` into the position (and marking the owed claimed). This is
-    /// exactly claim-then-use netted: unfunded owed contributes nothing, so a position can never be
-    /// opened on an unfunded IOU. Bounded to `MAX_OWED_DRAW` of the user's entries; the caller pulls
-    /// the remainder from the wallet. Returns the amount drawn.
-    function _drawOwedForCollateral(uint256 marketId, address user, uint256 need)
-        internal returns (uint256 drawn)
-    {
-        uint256[] storage ids = _userOwed[marketId][user];
-        uint256 n = ids.length;
-        uint256 iter = n < MAX_OWED_DRAW ? n : MAX_OWED_DRAW; // oldest entries first (lowest start ⇒ funded first)
-        for (uint256 i = 0; i < iter && drawn < need; i++) {
-            uint256 id = ids[i];
-            uint256 c = _entryClaimable(marketId, id);
-            if (c == 0) continue;
-            uint256 use = (need - drawn) < c ? (need - drawn) : c;
-            _owedQueue[marketId][id].claimed += uint128(use);
-            owedHead[marketId] += use;
-            _vault[marketId].poolAssets -= uint128(use);
-            drawn += use;
-        }
-    }
-
     // ============================================================
     // views
     // ============================================================
@@ -216,11 +193,6 @@ abstract contract H2Treasury is H2Storage {
     {
         OwedEntry storage e = _owedQueue[marketId][entryId];
         return (e.user, uint256(e.amount), uint256(e.claimed), _entryClaimable(marketId, entryId));
-    }
-
-    /// @notice The ids of a user's owed entries on a market (for UIs / claiming).
-    function owedEntriesOf(uint256 marketId, address user) external view override returns (uint256[] memory) {
-        return _userOwed[marketId][user];
     }
 
     function stakeOf(uint256 marketId, address user) external view override returns (StakeView memory) {
