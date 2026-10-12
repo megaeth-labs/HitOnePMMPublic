@@ -289,21 +289,24 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
         return _mtmValueAtMark(marketId, feed, feed.mark);
     }
 
-    /// @dev `_mtmValue` priced against an EXPLICIT mark (`mark1e18`), with the funding term projected
-    /// from `feed`'s last index/rate/push at that same mark reference. The normal NAV passes the
-    /// primary feed's own mark; the fallback LP-pricing path passes a fallback edge price (the feed
-    /// still supplies the funding seeds, since the fallback carries no funding index). `outstanding`
-    /// is subtracted and the result clamped ≥ 0 in both.
+    /// @dev `_mtmValue` priced against an EXPLICIT mark (`mark1e18`) for the PRICE-PnL term only. The
+    /// funding term is always projected off `feed.mark` (the last primary mark, stale or not) — NOT
+    /// the passed mark — so it matches `_indexNow`, the convention the actual settlement path uses.
+    /// This matters on the fallback LP-pricing path, which passes a banded fallback edge price: that
+    /// edge must move price PnL (the LP-adverse lever) without re-pricing funding onto a basis
+    /// settlement never uses. The normal NAV passes `feed.mark`, so the two references coincide and
+    /// this is a no-op there. `outstanding` is subtracted and the result clamped ≥ 0 in both.
     function _mtmValueAtMark(uint256 marketId, IH2Oracle.FeedView memory feed, uint256 mark1e18)
         internal view returns (uint256)
     {
         int256 base = int256(uint256(_vault[marketId].poolAssets)) - int256(_outstanding(marketId));
         if (feed.lastPushMs != 0) { // positions can only exist once the feed has been pushed
             uint64 nowMs = uint64(_microTimestamp() / 1000);
+            // Funding tracks feed.mark (matches _indexNow); only price PnL uses the passed mark.
             int128 idxLong = FundingIndex.effectiveAtPctMs(
-                feed.fundingIndexLong, feed.rateLong, mark1e18, feed.lastPushMs, nowMs);
+                feed.fundingIndexLong, feed.rateLong, feed.mark, feed.lastPushMs, nowMs);
             int128 idxShort = FundingIndex.effectiveAtPctMs(
-                feed.fundingIndexShort, feed.rateShort, mark1e18, feed.lastPushMs, nowMs);
+                feed.fundingIndexShort, feed.rateShort, feed.mark, feed.lastPushMs, nowMs);
             uint256 markUnits = mark1e18 / _risk[marketId].priceTick;
             base -= _sideEffPnl(marketId, true, markUnits, idxLong)
                   + _sideEffPnl(marketId, false, markUnits, idxShort);
