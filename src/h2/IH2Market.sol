@@ -172,11 +172,14 @@ interface IH2Market {
     /// @notice A market's share vault.
     struct VaultView {
         uint256 totalShares;
-        uint256 poolAssets;     // USDM backing the shares (post-rake)
-        uint256 sharePrice;     // poolAssets per share, 1e18-scaled (virtual-offset)
+        uint256 poolAssets;     // USDM backing the shares (post-rake), settled basis
+        uint256 mtmValue;       // marked-to-market vault value = poolAssets − net unrealized trader PnL
+        uint256 sharePrice;     // mtmValue per share, 1e18-scaled (virtual-offset) — the NAV used to mint/redeem
         uint256 rakeOwed;       // feed operator's accrued rake, claimable
         address rakeRecipient;  // the feed operator
         uint256 rakePpm;        // the feed's frozen rake
+        uint256 outstanding;    // total unpaid owed winnings (senior to LPs; already netted into mtmValue)
+        bool    stale;          // primary feed stale ⇒ deposit/withdraw price off the fallback (adverse band)
     }
 
     /// @notice A user's stake in a market's vault.
@@ -273,6 +276,10 @@ interface IH2Market {
     );
     /// @notice A builder claimed its accrued fees.
     event BuilderFeesClaimed(address indexed builder, address indexed to, uint256 amount);
+    /// @notice A winning close outran the liquid pool: `amount` is enqueued as owed to `user`
+    /// (entry `entryId`), senior to LPs and claimable via `claimWinnings` as the pool refills.
+    event WinningsOwed(uint256 indexed marketId, address indexed user, uint256 entryId, uint256 amount);
+    event WinningsClaimed(uint256 indexed marketId, address indexed user, uint256 entryId, uint256 amount);
 
     // ============================================================
     // errors
@@ -324,7 +331,10 @@ interface IH2Market {
     error NothingStaked();    // no pending unstake to withdraw
     error CooldownActive();        // withdraw before the unstake cooldown elapsed
     error UnstakeExpired();        // matured unstake request older than the withdraw window; re-request
+    error InsufficientLiquidity(); // withdrawal's MTM value exceeds liquid poolAssets — wait for open positions to settle
+    error NoFreshPrice();          // deposit/withdraw while BOTH the primary and the fallback are stale — LPs wait
     error NotFeedOperator();  // claimRake caller is not the primary feed's operator
+    error NotOwed();          // claimWinnings caller does not own that owed entry
     error ZeroAddress();
     error ZeroAmount();
 
@@ -457,6 +467,16 @@ interface IH2Market {
     /// @notice Claim the caller's accrued builder fees to `to` (USDM). Fees accrue in the market
     /// as orders fill; the registry only gated eligibility to accrue them.
     function claimBuilderFees(address to) external;
+
+    /// @notice Claim the funded part of an owed-winnings entry (a winning close the pool couldn't
+    /// fully pay). Owner-only; callable repeatedly as the pool refills. FIFO by enqueue order.
+    function claimWinnings(uint256 marketId, uint256 entryId) external returns (uint256 amount);
+    /// @notice Total unpaid owed winnings on a market (senior to LPs).
+    function owedOf(uint256 marketId) external view returns (uint256);
+    /// @notice An owed entry's user/amount/claimed plus how much is claimable right now. Discover a
+    /// user's `entryId`s off-chain from the `WinningsOwed(marketId, user, entryId, amount)` event.
+    function owedEntry(uint256 marketId, uint256 entryId)
+        external view returns (address user, uint256 amount, uint256 claimed, uint256 claimable);
 
     /// @notice The caller/builder's accrued, claimable fees (USDM).
     function builderOwed(address builder) external view returns (uint256);

@@ -9,7 +9,7 @@ contract Zenith25 is H2MarketTest {
     function test_F25_matureRequestExpiresAfterTwoDays() public {
         uint256 cs = h.stakeOf(mkt, carl).shares;
         vm.prank(carl); h.requestUnstake(mkt, cs);
-        _adv(TERM + 2 days);                               // last second of the window
+        _adv(TERM + 2 days); _pushMark(50_000e18, 0, 0, 0); // last second of the window
         vm.prank(carl); uint256 out = h.withdraw(mkt);
         assertGt(out, 0, "withdrawable at the end of the window");
     }
@@ -17,7 +17,7 @@ contract Zenith25 is H2MarketTest {
     function test_F25_expiredRequestRevertsAndKeepsShares() public {
         uint256 cs = h.stakeOf(mkt, carl).shares;
         vm.prank(carl); h.requestUnstake(mkt, cs);
-        _adv(TERM + 2 days + 1);
+        _adv(TERM + 2 days + 1); _pushMark(50_000e18, 0, 0, 0);
         vm.prank(carl);
         vm.expectRevert(IH2Market.UnstakeExpired.selector);
         h.withdraw(mkt);
@@ -27,7 +27,7 @@ contract Zenith25 is H2MarketTest {
         vm.prank(carl);
         vm.expectRevert(IH2Market.CooldownActive.selector);
         h.withdraw(mkt);
-        _adv(TERM);
+        _adv(TERM); _pushMark(50_000e18, 0, 0, 0);
         vm.prank(carl); assertGt(h.withdraw(mkt), 0);
     }
 }

@@ -12,8 +12,11 @@ import { EIP712 } from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 
 import { IH2Market } from "./IH2Market.sol";
 import { IH2Oracle } from "./IH2Oracle.sol";
+import { IAggregatorV3 } from "../common/IAggregatorV3.sol";
 import { IBuilderRegistry } from "./IBuilderRegistry.sol";
 import { IHighPrecisionTimestamp } from "../common/IHighPrecisionTimestamp.sol";
+import { FundingIndex } from "../common/FundingIndex.sol";
+import { ParamCatalog } from "../common/ParamCatalog.sol";
 
 /// @title H2Storage
 /// @notice Shared storage layout, constants, immutables, modifiers and helpers for the H2
@@ -160,6 +163,40 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
     }
     mapping(uint256 => mapping(address => Unstake)) internal _unstake;
 
+    /// @notice Per-side running aggregates of OPEN positions, for the marked-to-market NAV
+    /// (see `_mtmValue`). `sumSize` = Σ size (sizeUnits); `sumEntryW` = Σ entryPrice·size;
+    /// `sumCheckW` = Σ fundingCheckpoint·size (signed). Maintained O(1) on every
+    /// open/increase/decrease/close/wipe so the NAV can value open positions without
+    /// iterating them. Bounded by the market's OI caps (another reason to set real
+    /// `maxOIGross`), but kept in full-width 256-bit to never silently wrap.
+    struct OpenAgg {
+        uint256 sumSize;
+        uint256 sumEntryW;
+        int256  sumCheckW;
+    }
+    mapping(uint256 => mapping(bool => OpenAgg)) internal _openAgg;
+
+    // ---- owed winnings (graceful degradation: a winning close pays what's liquid now and
+    //      enqueues the shortfall, senior to LPs, claimable as the pool refills) ----
+
+    /// @notice One owed entry = the unpaid part of a winning close. `start` is the cumulative
+    /// `owedTail` at enqueue time; `amount` the shortfall; `claimed` what's been paid out of it.
+    /// FIFO is enforced purely by `start`: an entry is fundable only once the pool has covered
+    /// everything enqueued before it, so claim order never matters (no race).
+    struct OwedEntry {
+        address user;    // 20
+        uint128 start;   // cumulative owedTail at enqueue
+        uint128 amount;  // shortfall owed
+        uint128 claimed; // paid so far
+    }
+    /// @notice Per-market owed queue plus the two monotonic cumulative counters that make the
+    /// funded frontier O(1): `owedTail` = Σ ever enqueued, `owedHead` = Σ ever paid;
+    /// `outstanding = owedTail − owedHead`. Each entry is claimed by its owner via `claimWinnings`
+    /// (keyed by the `entryId` carried in the `WinningsOwed` event) — there is no per-user index.
+    mapping(uint256 => OwedEntry[]) internal _owedQueue;
+    mapping(uint256 => uint256) internal owedTail;
+    mapping(uint256 => uint256) internal owedHead;
+
     constructor(address usdm_, address oracle_) {
         if (usdm_ == address(0) || oracle_ == address(0)) revert ZeroAddress();
         usdm = IERC20(usdm_);
@@ -195,6 +232,207 @@ abstract contract H2Storage is IH2Market, ReentrancyGuard, EIP712 {
         if (t > 1e14) return t / 1_000_000;
         if (t > 1e11) return t / 1_000;
         return t;
+    }
+
+    // ---- marked-to-market NAV ----
+
+    /// @dev Add an opening slice to its side's open-position aggregates.
+    function _openAggAdd(uint256 marketId, bool isLong, uint256 size, uint256 entry, int256 check) internal {
+        OpenAgg storage a = _openAgg[marketId][isLong];
+        a.sumSize   += size;
+        a.sumEntryW += entry * size;
+        a.sumCheckW += check * int256(size);
+    }
+
+    /// @dev Remove a slice from its side's aggregates — a full close, a decrease portion, a
+    /// liquidation wipe, or the OLD state of an increase. Uses the STORED (rounded) entry and
+    /// checkpoint so the aggregate tracks exactly what settlement will compute.
+    function _openAggSub(uint256 marketId, bool isLong, uint256 size, uint256 entry, int256 check) internal {
+        OpenAgg storage a = _openAgg[marketId][isLong];
+        a.sumSize   -= size;
+        a.sumEntryW -= entry * size;
+        a.sumCheckW -= check * int256(size);
+    }
+
+    /// @dev One side's unrealized effective PnL (price PnL − own-side funding) aggregated over its
+    /// open positions, mirroring `_settleSlice`. Price PnL is exact; the funding term divides the
+    /// summed numerator once (vs once per position in `_settleSlice`), so a multi-position pool's
+    /// funding differs by < 1 wei per position in the SCALE division — negligible, and exact for a
+    /// single position. Positive ⇒ traders up ⇒ the pool owes it.
+    function _sideEffPnl(uint256 marketId, bool isLong, uint256 markUnits, int128 indexNow)
+        internal view returns (int256)
+    {
+        OpenAgg storage a = _openAgg[marketId][isLong];
+        uint256 sz = a.sumSize;
+        if (sz == 0) return 0;
+        RiskParams storage r = _risk[marketId];
+        int256 markTerm  = int256(markUnits) * int256(sz);
+        int256 entryTerm = int256(a.sumEntryW);
+        // long profits when mark > entry; short when entry > mark (mirrors _settleSlice's priceDiff).
+        int256 priceDiff = isLong ? (markTerm - entryTerm) : (entryTerm - markTerm);
+        int256 pricePnl  = priceDiff * int256(uint256(r.notionalScale));
+        int256 funding   = (int256(indexNow) * int256(sz) - a.sumCheckW)
+                           * int256(uint256(r.sizeTick)) / int256(ParamCatalog.SCALE);
+        return pricePnl - funding;
+    }
+
+    /// @dev The vault's MARKED-TO-MARKET value: `poolAssets` minus the net unrealized effPnl the
+    /// pool owes its open positions (their profit is the pool's liability). `deposit`/`withdraw`
+    /// price against this, not raw `poolAssets`, so a stale-NAV first-mover can neither extract on
+    /// exit (traders net-up ⇒ mtm < poolAssets) nor mint outsized shares on entry (traders net-down
+    /// ⇒ mtm > poolAssets). O(1) from the per-side aggregates.
+    ///
+    /// APPROXIMATION (accepted): uses UNCAPPED unrealized loss — a losing position cannot actually
+    /// lose past its collateral (beyond that it is liquidatable), so mtm slightly overstates the
+    /// pool's claim on deeply-underwater, not-yet-liquidated positions; `liqWidthPpm` bounds that
+    /// window. It also ignores the (non-linear, un-aggregatable) winnings cut, which only
+    /// understates the LPs' share — conservative.
+    /// The owed-winnings `outstanding` is also subtracted: it is a SETTLED liability senior to the
+    /// LPs (winners the pool couldn't fully pay yet), so LP value is `poolAssets − outstanding −
+    /// net open effPnl`.
+    function _mtmValue(uint256 marketId) internal view returns (uint256) {
+        IH2Oracle.FeedView memory feed = _oracle.feedOf(_oracles[marketId].primaryFeedId);
+        return _mtmValueAtMark(marketId, feed, feed.mark);
+    }
+
+    /// @dev `_mtmValue` priced against an EXPLICIT mark (`mark1e18`) for the PRICE-PnL term only. The
+    /// funding term is always projected off `feed.mark` (the last primary mark, stale or not) — NOT
+    /// the passed mark — so it matches `_indexNow`, the convention the actual settlement path uses.
+    /// This matters on the fallback LP-pricing path, which passes a banded fallback edge price: that
+    /// edge must move price PnL (the LP-adverse lever) without re-pricing funding onto a basis
+    /// settlement never uses. The normal NAV passes `feed.mark`, so the two references coincide and
+    /// this is a no-op there. `outstanding` is subtracted and the result clamped ≥ 0 in both.
+    function _mtmValueAtMark(uint256 marketId, IH2Oracle.FeedView memory feed, uint256 mark1e18)
+        internal view returns (uint256)
+    {
+        int256 base = int256(uint256(_vault[marketId].poolAssets)) - int256(_outstanding(marketId));
+        if (feed.lastPushMs != 0) { // positions can only exist once the feed has been pushed
+            uint64 nowMs = uint64(_microTimestamp() / 1000);
+            // Funding tracks feed.mark (matches _indexNow); only price PnL uses the passed mark.
+            int128 idxLong = FundingIndex.effectiveAtPctMs(
+                feed.fundingIndexLong, feed.rateLong, feed.mark, feed.lastPushMs, nowMs);
+            int128 idxShort = FundingIndex.effectiveAtPctMs(
+                feed.fundingIndexShort, feed.rateShort, feed.mark, feed.lastPushMs, nowMs);
+            uint256 markUnits = mark1e18 / _risk[marketId].priceTick;
+            base -= _sideEffPnl(marketId, true, markUnits, idxLong)
+                  + _sideEffPnl(marketId, false, markUnits, idxShort);
+        }
+        return base <= 0 ? 0 : uint256(base);
+    }
+
+    // ---- oracle staleness + fallback read (shared by H2Markets and the LP-pricing path) ----
+
+    /// @dev Primary feed staleness on the HP clock — the fallback path's arming test. A never-
+    /// published feed does NOT arm: no position can exist on it (both execution paths refuse), and
+    /// arming it would let positions exist against a zero mark.
+    function _primaryStale(uint256 marketId, IH2Oracle.FeedView memory feed)
+        internal view returns (bool)
+    {
+        if (feed.lastPushMs == 0) return false;
+        uint64 nowMs = uint64(_microTimestamp() / 1000);
+        return nowMs - feed.lastPushMs > uint64(_oracles[marketId].primaryStaleSecs) * 1000;
+    }
+
+    /// @dev The fallback feed's price (1e18) and freshness, per the market's params — never
+    /// reverts. `ok == false` when the fallback is unavailable: it reverts, or answers
+    /// non-positive or stamped more than 60 s ahead of block time (clock-skew tolerance: a
+    /// round therefore counts as fresh for up to `fallbackMaxAge` + 60 s). Callers decide
+    /// whether that is fatal.
+    function _tryFallbackRead(OracleParams storage o)
+        internal view returns (bool ok, uint256 price1e18, bool fresh)
+    {
+        try IAggregatorV3(o.fallbackFeed).latestRoundData()
+            returns (uint80, int256 answer, uint256, uint256 updatedAt, uint80)
+        {
+            uint256 upd = _updatedAtSecs(updatedAt);
+            if (answer <= 0 || upd > block.timestamp + 60) return (false, 0, false);
+            return (true, uint256(answer) * (10 ** (18 - uint256(o.fallbackDecimals))),
+                    block.timestamp <= upd + uint256(o.fallbackMaxAge));
+        } catch {
+            return (false, 0, false);
+        }
+    }
+
+    /// @dev Mandatory fallback read (fallback-mode execution and liquidation): an unavailable
+    /// fallback reverts `OracleBadAnswer`.
+    function _fallbackRead(OracleParams storage o)
+        internal view returns (uint256 price1e18, bool fresh)
+    {
+        bool ok;
+        (ok, price1e18, fresh) = _tryFallbackRead(o);
+        if (!ok) revert OracleBadAnswer();
+    }
+
+    /// @dev The NAV `deposit`/`withdraw` price against, plus the staleness regime (for views).
+    /// Normal regime (primary FRESH): the marked-to-market value off the primary mark — unchanged.
+    /// Primary-STALE regime: LPs are not time-sensitive, so rather than block them we price off the
+    /// FRESH fallback at an LP-ADVERSE band edge (± `fbCloseSpreadPpm`): a depositor mints at the
+    /// HIGH NAV (fewer shares), a withdrawer redeems at the LOW NAV, so transacting through a primary
+    /// outage can never extract value from a mispriced NAV. Both band edges are evaluated and the
+    /// adverse one chosen, so the sign of net OI need not be reasoned about. The `outstanding` senior
+    /// subtraction and the ≥0 clamp live inside `_mtmValueAtMark` and apply in both regimes. Reverts
+    /// `NoFreshPrice` when BOTH sources are stale (LPs wait); `claimWinnings` needs no mark and is
+    /// exempt.
+    function _lpNav(uint256 marketId, bool isWithdraw) internal view returns (uint256 nav, bool stale) {
+        IH2Oracle.FeedView memory feed = _oracle.feedOf(_oracles[marketId].primaryFeedId);
+        stale = _primaryStale(marketId, feed);
+        if (!stale) return (_mtmValueAtMark(marketId, feed, feed.mark), false);
+        OracleParams storage o = _oracles[marketId];
+        (uint256 fb, bool fresh) = _fallbackRead(o);
+        if (!fresh) revert NoFreshPrice();
+        uint256 band = uint256(o.fbCloseSpreadPpm);
+        uint256 lo = _mtmValueAtMark(marketId, feed, fb * (PPM - band) / PPM);
+        uint256 hi = _mtmValueAtMark(marketId, feed, fb * (PPM + band) / PPM);
+        nav = isWithdraw ? (lo < hi ? lo : hi) : (lo > hi ? lo : hi);
+    }
+
+    // ---- owed-winnings queue helpers (FIFO funded frontier) ----
+
+    /// @dev Total unpaid owed on a market (senior to LPs).
+    function _outstanding(uint256 marketId) internal view returns (uint256) {
+        return owedTail[marketId] - owedHead[marketId];
+    }
+
+    /// @dev The pool cash a NEW winner may drain: `poolAssets` minus the senior owed reservation,
+    /// floored at 0. Keeps already-enqueued owed fully funded ahead of any fresh winning draw.
+    function _drainable(uint256 marketId) internal view returns (uint256) {
+        uint256 pa = uint256(_vault[marketId].poolAssets);
+        uint256 o  = _outstanding(marketId);
+        return pa > o ? pa - o : 0;
+    }
+
+    /// @dev The cumulative owed position the pool can currently fund: everything paid, plus the
+    /// liquid pool, capped at everything enqueued. An entry at `start` is funded iff this exceeds
+    /// `start` — so earlier entries (lower `start`) are always covered first, regardless of who
+    /// calls claim. `owedHead + poolAssets` is invariant to a claim (both move by the paid amount),
+    /// so claiming never retroactively unfunds another entry.
+    function _headFundable(uint256 marketId) internal view returns (uint256) {
+        uint256 tail = owedTail[marketId];
+        uint256 funded = owedHead[marketId] + uint256(_vault[marketId].poolAssets);
+        return funded < tail ? funded : tail;
+    }
+
+    /// @dev How much of entry `id` is claimable right now = clamp(headFundable − start, 0, amount) − claimed.
+    function _entryClaimable(uint256 marketId, uint256 id) internal view returns (uint256) {
+        OwedEntry storage e = _owedQueue[marketId][id];
+        uint256 start = uint256(e.start);
+        uint256 hf    = _headFundable(marketId);
+        if (hf <= start) return 0;
+        uint256 fundedAmt = hf - start;
+        uint256 amount = uint256(e.amount);
+        if (fundedAmt > amount) fundedAmt = amount;
+        uint256 claimed = uint256(e.claimed);
+        return fundedAmt > claimed ? fundedAmt - claimed : 0;
+    }
+
+    /// @dev Enqueue a shortfall owed to `user`; records `start = owedTail` (so it is junior to all
+    /// prior owed) and bumps the tail. Returns the entry id.
+    function _enqueueOwed(uint256 marketId, address user, uint256 amount) internal returns (uint256 id) {
+        id = _owedQueue[marketId].length;
+        _owedQueue[marketId].push(OwedEntry({
+            user: user, start: uint128(owedTail[marketId]), amount: uint128(amount), claimed: 0
+        }));
+        owedTail[marketId] += amount;
     }
 
     // ---- builder eligibility ----

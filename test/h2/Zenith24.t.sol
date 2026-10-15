@@ -48,7 +48,7 @@ contract Zenith24 is H2MarketTest {
         vm.prank(bob); uint256 sh = h.deposit(mkt, 1_000e18);
         assertEq(sh, 1_000e18);
         vm.prank(bob); h.requestUnstake(mkt, sh);
-        _adv(TERM);
+        _adv(TERM); _pushMark(50_000e18, 0, 0, 0); // withdraw prices at a fresh mark
         vm.prank(bob); assertEq(h.withdraw(mkt), 1_000e18);
     }
 }
