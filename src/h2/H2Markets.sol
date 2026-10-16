@@ -201,36 +201,6 @@ abstract contract H2Markets is H2Storage {
         );
     }
 
-    /// @dev The fallback feed's price (1e18) and freshness, per the market's params — never
-    /// reverts. `ok == false` when the fallback is unavailable: it reverts, or answers
-    /// non-positive or stamped more than 60 s ahead of block time (clock-skew tolerance: a
-    /// round therefore counts as fresh for up to `fallbackMaxAge` + 60 s). Callers decide
-    /// whether that is fatal.
-    function _tryFallbackRead(OracleParams storage o)
-        internal view returns (bool ok, uint256 price1e18, bool fresh)
-    {
-        try IAggregatorV3(o.fallbackFeed).latestRoundData()
-            returns (uint80, int256 answer, uint256, uint256 updatedAt, uint80)
-        {
-            uint256 upd = _updatedAtSecs(updatedAt);
-            if (answer <= 0 || upd > block.timestamp + 60) return (false, 0, false);
-            return (true, uint256(answer) * (10 ** (18 - uint256(o.fallbackDecimals))),
-                    block.timestamp <= upd + uint256(o.fallbackMaxAge));
-        } catch {
-            return (false, 0, false);
-        }
-    }
-
-    /// @dev Mandatory fallback read (fallback-mode execution and liquidation): an unavailable
-    /// fallback reverts `OracleBadAnswer`.
-    function _fallbackRead(OracleParams storage o)
-        internal view returns (uint256 price1e18, bool fresh)
-    {
-        bool ok;
-        (ok, price1e18, fresh) = _tryFallbackRead(o);
-        if (!ok) revert OracleBadAnswer();
-    }
-
     /// @dev THE CONVERGENCE CHECK: require the primary mark and the fallback to agree
     /// within `maxDeviationPpm` — a fresh fallback that disagrees blocks the action rather
     /// than letting either price win. Publications are ungated (the oracle doesn't know
@@ -259,14 +229,4 @@ abstract contract H2Markets is H2Storage {
         if (diff * PPM > uint256(o.maxDeviationPpm) * fb) revert DeviationGate();
     }
 
-    /// @dev Primary feed staleness on the HP clock — the fallback path's arming test.
-    /// A never-published feed does NOT arm: no position can exist on it (both execution
-    /// paths refuse), and arming it would let positions exist against a zero mark.
-    function _primaryStale(uint256 marketId, IH2Oracle.FeedView memory feed)
-        internal view returns (bool)
-    {
-        if (feed.lastPushMs == 0) return false;
-        uint64 nowMs = uint64(_microTimestamp() / 1000);
-        return nowMs - feed.lastPushMs > uint64(_oracles[marketId].primaryStaleSecs) * 1000;
-    }
 }

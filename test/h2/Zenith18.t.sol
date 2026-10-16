@@ -4,9 +4,9 @@ pragma solidity ^0.8.27;
 import { H2MarketTest } from "./H2Market.t.sol";
 import { IH2Market }  from "../../src/h2/IH2Market.sol";
 
-/// Zenith #18 — a winning settlement's solvency check runs against the pool's NET debit (gross
-/// profit less the pool's share of the winnings cut), so a fundable close no longer reverts
-/// `Insolvent` when the pool is within one cut of the gross profit.
+/// Zenith #18 — a winning close whose gross profit outruns the liquid pool no longer reverts
+/// `Insolvent`. The owed-winnings queue (PR 2) pays what is liquid and enqueues the rest, senior to
+/// LPs; the pool still ends at the exact NET debit (gross profit less its share of the fees).
 contract Zenith18 is H2MarketTest {
     uint256 internal _nn = 1000;
 
@@ -41,21 +41,36 @@ contract Zenith18 is H2MarketTest {
     function test_F18_fundableCloseSettlesOnNetDebit() public {
         (uint256 m, uint256 id) = _closeOn(938.75e18);
         assertTrue(h.positions(id).closed, "fundable close settles");
+        // The pool drains its liquid 960 and collects 68.425 of fees (80.5 net of the 15% rake);
+        // the 40 the drain could not cover is owed to alice, senior to LPs.
+        assertEq(h.vaultOf(m).poolAssets, 68.425e18, "pool holds the fees it collected");
+        assertEq(h.owedOf(m), 40e18, "shortfall enqueued as owed");
+        (address user,, , uint256 claimable) = h.owedEntry(m, 0);
+        assertEq(user, alice); assertEq(claimable, 40e18, "fully funded by the collected fees");
+        vm.prank(alice); assertEq(h.claimWinnings(m, 0), 40e18);
         // 960 + 21.675 (close fee, net of rake) + 46.75 (cut, net of rake) − 1,000
         assertEq(h.vaultOf(m).poolAssets, 28.425e18, "pool ends at the exact net");
+        assertEq(h.owedOf(m), 0);
     }
 
-    function test_F18_unfundableCloseStillRevertsInsolvent() public {
-        // pool 921.25 at the close: 921.25 + 21.675 + 46.75 = 989.675 < 1,000 ⇒ still Insolvent
+    function test_F18_unfundableCloseEnqueuesInsteadOfReverting() public {
+        // pool 921.25 at the close: 921.25 + 21.675 + 46.75 = 989.675 < 1,000 — the audited code
+        // (and the net-debit reorder) left this close stuck; now it settles and owes the difference.
         (uint256 m, uint256 id) = _closeOn(900e18);
-        assertFalse(h.positions(id).closed, "a genuinely unfundable win still waits");
-        assertEq(h.vaultOf(m).poolAssets, 921.25e18, "pool untouched by the reverted close");
+        assertTrue(h.positions(id).closed, "a genuinely unfundable win still settles");
+        assertEq(h.vaultOf(m).poolAssets, 68.425e18, "pool drained to its collected fees");
+        assertEq(h.owedOf(m), 78.75e18, "1,419.5 net entitlement - 1,340.75 paid");
+        (,,, uint256 claimable) = h.owedEntry(m, 0);
+        assertEq(claimable, 68.425e18, "only the funded frontier is claimable");
+        vm.prank(alice); assertEq(h.claimWinnings(m, 0), 68.425e18);
+        assertEq(h.owedOf(m), 10.325e18, "remainder waits for the pool to refill");
     }
 
     function test_F18_finalBalancesUnchangedWhenAmplyFunded() public {
         (uint256 m, uint256 id) = _closeOn(10_000e18);
         assertTrue(h.positions(id).closed);
-        // 10,000 + 21.25 + 21.675 + 46.75 − 1,000: the reorder moves the check, not the money
-        assertEq(h.vaultOf(m).poolAssets, 9_089.675e18, "same final pool as before the reorder");
+        assertEq(h.owedOf(m), 0, "nothing owed when the pool covers the gross");
+        // 10,000 + 21.25 + 21.675 + 46.75 − 1,000
+        assertEq(h.vaultOf(m).poolAssets, 9_089.675e18, "same final pool as before");
     }
 }
