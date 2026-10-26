@@ -1,17 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
-// Evaluates src/h2/DEPLOY_RULES.md against the parameters DeployH2Mainnet.s.sol would deploy
-// with the current env. WARN-ONLY: it never reverts and sends nothing; the deployer reads the
-// table. mainnet-deploy.sh runs it in the preflight. The rules are configuration policy the
-// contracts cannot enforce; the deploy script itself stays policy-free.
-//
-//   source script/h2/mainnet.env
-//   forge script script/h2/CheckH2Rules.s.sol --rpc-url $RPC_4326 -vv
-//
-// Needs the same per-market env as the deploy (FALLBACK_FEEDS, PRICE_TICKS, SIZE_TICKS, optional
-// REF_FEEDS); USDM / MARKET_TOKENS are not required. Fallback decimals (rule 3) are read on chain,
-// so point it at the target RPC.
+// Evaluates src/h2/DEPLOY_RULES.md against the parameters DeployH2Mainnet.s.sol deploys (both
+// read H2MainnetParams.sol). WARN-ONLY: it never reverts and sends nothing; the deployer reads the
+// table. DeployH2Mainnet runs it before broadcasting; it also runs on its own:
+//   forge script script/h2/CheckH2Rules.s.sol --rpc-url https://mainnet.megaeth.com/rpc
+// Fallback decimals (rule 3) are read on chain, so point it at the target RPC. The rules are
+// configuration policy the contracts cannot enforce; the deploy itself stays policy-free.
 
 import { console2 }        from "forge-std/Script.sol";
 import { H2MainnetParams } from "./H2MainnetParams.sol";
@@ -27,14 +22,14 @@ contract CheckH2Rules is H2MainnetParams {
     uint256 internal _warned;
 
     function run() external returns (uint256 passed, uint256 warned) {
-        address[] memory fallbacks  = vm.envAddress("FALLBACK_FEEDS", ",");
-        uint256[] memory priceTicks = vm.envUint("PRICE_TICKS", ",");
-        uint256[] memory sizeTicks  = vm.envUint("SIZE_TICKS", ",");
-        address[] memory refs       = vm.envOr("REF_FEEDS", ",", fallbacks);
+        address[] memory fallbacks  = _fallbacks();
+        uint256[] memory priceTicks = _priceTicks();
+        uint256[] memory sizeTicks  = _sizeTicks();
+        address[] memory refs       = _refs();
         uint256 n = fallbacks.length;
         console2.log("Deployment rules (src/h2/DEPLOY_RULES.md), warn-only");
         _check(priceTicks.length == n && sizeTicks.length == n && refs.length == n,
-            "env: per-market lists have equal length");
+            "per-market lists have equal length");
 
         IH2Market.FeeParams memory fees = _fees();
 

@@ -1,23 +1,45 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.27;
 
-// The ONE place the mainnet market parameters are built. DeployH2Mainnet.s.sol creates markets
-// from these helpers and CheckH2Rules.s.sol evaluates src/h2/DEPLOY_RULES.md against the same
-// values, so the rules are checked against exactly what gets deployed. Env names and defaults are
-// documented in DeployH2Mainnet.s.sol; the hard-coded values are the mainnet BTC parameters.
+// The ONE place the mainnet launch configuration lives. DeployH2Mainnet.s.sol deploys exactly
+// these values and CheckH2Rules.s.sol evaluates src/h2/DEPLOY_RULES.md against the same values.
+// No env file is needed: the constants below ARE the MegaETH mainnet (4326) launch. Every getter
+// still takes an env override (same names as before), which the rules-checker test uses.
 
 import { Script }    from "forge-std/Script.sol";
 import { IH2Market } from "../../src/h2/IH2Market.sol";
 
 abstract contract H2MainnetParams is Script {
-    // ---- feed-level env ----------------------------------------------------
+    // ---- launch configuration: MegaETH mainnet 4326, one BTC market ----------
+    uint256 internal constant CHAIN_ID     = 4326;
+    address internal constant USDM         = 0xFAfDdbb3FC7688494971a79cc65DCa3EF82079E7; // USDm (MegaUSD), 18 dec, settlement
+    address internal constant WBTC         = 0x32090fB1399a31cC095e6341a6353b7c09ba84FB; // market token, identity only
+    address internal constant REDSTONE_BTC = 0xf0DEbDAE819b354D076b0D162e399BE013A856d3; // BTC/USD fallback + reference, 8 dec
+    address internal constant OPERATOR     = 0x159B0e603c58899F53a0633fc37F3167b6AB6F39; // pushes marks, receives the rake
+    uint256 internal constant PRICE_TICK   = 1e18;     // $1
+    uint256 internal constant SIZE_TICK    = 1e10;     // 1e-8 BTC
+    uint256 internal constant SEED_USDM    = 1_000e18; // per market; >= maxOISkew x 10% move (#43)
+
+    function _chainId()  internal view returns (uint256) { return vm.envOr("EXPECT_CHAIN_ID", CHAIN_ID); }
+    function _usdm()     internal view returns (address) { return vm.envOr("USDM", USDM); }
+    function _operator() internal view returns (address) { return vm.envOr("OPERATOR", OPERATOR); }
+    function _tokens()     internal view returns (address[] memory) { return vm.envOr("MARKET_TOKENS", ",", _addrs(WBTC)); }
+    function _fallbacks()  internal view returns (address[] memory) { return vm.envOr("FALLBACK_FEEDS", ",", _addrs(REDSTONE_BTC)); }
+    function _refs()       internal view returns (address[] memory) { return vm.envOr("REF_FEEDS", ",", _fallbacks()); }
+    function _priceTicks() internal view returns (uint256[] memory) { return vm.envOr("PRICE_TICKS", ",", _uints(PRICE_TICK)); }
+    function _sizeTicks()  internal view returns (uint256[] memory) { return vm.envOr("SIZE_TICKS", ",", _uints(SIZE_TICK)); }
+
+    function _addrs(address a) private pure returns (address[] memory out) { out = new address[](1); out[0] = a; }
+    function _uints(uint256 v) private pure returns (uint256[] memory out) { out = new uint256[](1); out[0] = v; }
+
+    // ---- feed-level ----------------------------------------------------------
     function _refBandPpm()  internal view returns (uint32)  { return uint32(vm.envOr("REF_BAND_PPM", uint256(10_000))); }
     function _refMaxStale() internal view returns (uint32)  { return uint32(vm.envOr("REF_MAX_STALE", uint256(21_600))); }
     function _feeRakePpm()  internal view returns (uint32)  { return uint32(vm.envOr("FEE_RAKE_PPM", uint256(150_000))); }
     function _maxRate()     internal view returns (uint64)  { return uint64(vm.envOr("MAX_RATE_PER_SEC", uint256(1_500_000_000_000_000))); }
-    function _bootstrap()   internal view returns (uint256) { return vm.envOr("BOOTSTRAP_USDM", uint256(0)); }
+    function _bootstrap()   internal view returns (uint256) { return vm.envOr("BOOTSTRAP_USDM", SEED_USDM); }
 
-    // ---- builder registry env (only read when a fresh registry is deployed) ----
+    // ---- builder registry (only read when a fresh registry is deployed) ------
     function _stakeToken() internal view returns (address) { return vm.envOr("BUILDER_STAKE_TOKEN", address(0)); }
     function _minStake()   internal view returns (uint256) { return vm.envOr("BUILDER_MIN_STAKE", uint256(0.01 ether)); }
 
@@ -46,7 +68,7 @@ abstract contract H2MainnetParams is Script {
             notionalScale: 0,
             minLeverage: 100, maxLeverage: 1000,
             maxPositionDuration: 30 days,
-            // #43 sizing (2026-10-26): seed >= maxOISkew x 10% worst move -> 1,000 USDm covers 10k skew.
+            // #43 sizing: the pool is every trade's counterparty, so seed >= maxOISkew x 10% move.
             maxPositionNotional: 10_000e18,
             maxOIGross: 40_000e18, maxOISkew: 10_000e18,
             liqWidthPpm: 0,

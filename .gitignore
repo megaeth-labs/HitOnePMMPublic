@@ -3,6 +3,3 @@ cache/
 broadcast/
 .env
 docs/
-
-# filled-in deploy env (copy of script/h2/mainnet.env.example)
-script/h2/mainnet.env

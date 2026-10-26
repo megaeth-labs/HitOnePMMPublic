@@ -2,22 +2,21 @@
 pragma solidity ^0.8.27;
 
 // H2 — MegaETH MAINNET (chain 4326) deploy: H2Oracle, H2Market, BuilderRegistry, then per market
-// createFeed + createMarket + the seed deposit.
+// createFeed + createMarket + the seed deposit (7 transactions for the one BTC market).
 //
-// Env-driven and logged before broadcast so every value can be reviewed in the dry run. Parameters
-// are built by H2MainnetParams.sol (shared with CheckH2Rules.s.sol, which evaluates
-// src/h2/DEPLOY_RULES.md against them, warn-only). Policy lives there and in the rules, not here.
+// Everything it deploys is in H2MainnetParams.sol; no env file. Before broadcasting it prints the
+// deployment-rules table (CheckH2Rules, warn-only) and checks what the chain must already hold:
+// USDm with 18 decimals, the deployer's USDm seed, the deployer not blacklisted, a fresh RedStone
+// answer, market tokens with code.
 //
-// Roles: the BROADCASTER deploys and is every market's creator and the holder of the seed LP
-// shares (not transferable), so it should be a cold wallet. OPERATOR pushes marks and receives the
-// rake; it defaults to the broadcaster.
-//
-// Run it through the wrapper, which adds the preflight these scripts cannot do (feed age,
-// balances, settlement token, hardware-wallet signing):
-//   cp script/h2/mainnet.env.example script/h2/mainnet.env   # fill in
-//   source script/h2/mainnet.env
-//   script/h2/mainnet-deploy.sh               # preflight + rules table + DRY RUN
-//   script/h2/mainnet-deploy.sh --broadcast   # for real
+// Dry run (simulates all 7 transactions, sends nothing):
+//   forge script script/h2/DeployH2Mainnet.s.sol --rpc-url https://mainnet.megaeth.com/rpc \
+//     --sender <deployer> --disable-code-size-limit
+// Deploy, signing on a hardware wallet (Foundry >= 1.8.6 for Trezor; add --resume to finish a
+// partial run instead of starting over):
+//   forge script script/h2/DeployH2Mainnet.s.sol --rpc-url https://mainnet.megaeth.com/rpc \
+//     --sender <deployer> --disable-code-size-limit --broadcast \
+//     --trezor --mnemonic-derivation-paths "m/44'/60'/0'/0/0"       # or --ledger
 
 import { console2 }        from "forge-std/Script.sol";
 import { IERC20 }          from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -28,48 +27,31 @@ import { BuilderRegistry } from "../../src/h2/BuilderRegistry.sol";
 import { IH2Market }       from "../../src/h2/IH2Market.sol";
 import { IAggregatorV3 }   from "../../src/common/IAggregatorV3.sol";
 import { H2MainnetParams } from "./H2MainnetParams.sol";
+import { CheckH2Rules }    from "./CheckH2Rules.s.sol";
+
+interface IBlacklistable { function isBlacklisted(address account) external view returns (bool); }
 
 contract DeployH2Mainnet is H2MainnetParams {
-    // ---- required env ------------------------------------------------------
-    //   USDM                 18-decimal settlement token (NOT a mock)
-    //   MARKET_TOKENS        comma-separated token addresses, one per market
-    //   FALLBACK_FEEDS       comma-separated AggregatorV3 feeds (RedStone/Bolt), one per market
-    //   PRICE_TICKS          comma-separated, 1e18-scale price quantum per market
-    //   SIZE_TICKS           comma-separated, 1e18-scale size quantum per market
-    // ---- optional env (defaults unless noted) -------------------------------
-    //   OPERATOR             feed operator / rake recipient (default: broadcaster)
-    //   REF_FEEDS            comma-separated reference feeds for the band check; omit = same as FALLBACK_FEEDS
-    //   REF_BAND_PPM         |mark - ref| band (default 10_000 = 1%)
-    //   REF_MAX_STALE        reference max age, seconds (default 21_600 = 6h)
-    //   FEE_RAKE_PPM         operator rake on pool gains (default 150_000 = 15%)
-    //   MAX_RATE_PER_SEC     feed funding-rate magnitude cap (default 1.5e15)
-    //   BOOTSTRAP_USDM       per-vault first-LP deposit in USDM wei (default 0 = skip; deployer must hold it)
-    //   BUILDER_REGISTRY     existing registry address; "0" disables builder codes;
-    //                        unset = deploy a fresh BuilderRegistry(BUILDER_STAKE_TOKEN, BUILDER_MIN_STAKE)
-    //   BUILDER_STAKE_TOKEN  0 = native ETH (default), else ERC-20 (e.g. MEGA)
-    //   BUILDER_MIN_STAKE    default 0.01 ether
-    //   MAX_DEVIATION_PPM    primary-vs-fallback both-fresh gate (default 10_000 = 1%; v5 testnet ran 100)
-    //   FALLBACK_MAX_AGE     seconds (default 60)
-    //   PRIMARY_STALE_SECS   seconds before the fallback path arms (default 300)
-    //   MAX_SPREAD_PPM       cap on the derived spread (default 5_000; 0 = no derived spread at all)
-    //   SPREAD_OPEN_VOL_K / SPREAD_OPEN_SKEW_K / SPREAD_CLOSE_VOL_K / SPREAD_CLOSE_SKEW_K (default 0)
-    //   MIN_ADJUST_GAP_BLOCKS (default 1)   MAX_BUILDER_FEE_PPM (default 100_000)
-    //   EXPECT_CHAIN_ID      default 4326 — override ONLY to dry-run this script elsewhere
+    // Every value comes from H2MainnetParams.sol. Each getter there also reads an env var of the
+    // same name (USDM, MARKET_TOKENS, FALLBACK_FEEDS, BOOTSTRAP_USDM, OPERATOR, ...) as an override
+    // for tests and other deployments; BUILDER_REGISTRY: unset = fresh registry, 0 = disabled.
 
     function run() external {
-        uint256 expectChain = vm.envOr("EXPECT_CHAIN_ID", uint256(4326));
-        require(block.chainid == expectChain, "wrong chain");
+        require(block.chainid == _chainId(), "wrong chain");
 
-        address usdm = vm.envAddress("USDM");
-        address[] memory tokens    = vm.envAddress("MARKET_TOKENS", ",");
-        address[] memory fallbacks = vm.envAddress("FALLBACK_FEEDS", ",");
-        uint256[] memory priceTicks = vm.envUint("PRICE_TICKS", ",");
-        uint256[] memory sizeTicks  = vm.envUint("SIZE_TICKS", ",");
-        address[] memory refs = vm.envOr("REF_FEEDS", ",", fallbacks);
+        address usdm = _usdm();
+        address[] memory tokens     = _tokens();
+        address[] memory fallbacks  = _fallbacks();
+        uint256[] memory priceTicks = _priceTicks();
+        uint256[] memory sizeTicks  = _sizeTicks();
+        address[] memory refs       = _refs();
         uint256 n = tokens.length;
-        require(n > 0, "MARKET_TOKENS empty");
+        require(n > 0, "no markets");
         require(fallbacks.length == n && priceTicks.length == n && sizeTicks.length == n && refs.length == n,
-            "per-market env lists must have equal length");
+            "per-market lists must have equal length");
+
+        // Deployment rules, warn-only: a WARN line is for the deployer to read, not a stop.
+        new CheckH2Rules().run();
 
         // ---- settlement token sanity: real, 18-decimal, has code ----
         require(usdm.code.length > 0, "USDM has no code");
@@ -85,11 +67,9 @@ contract DeployH2Mainnet is H2MainnetParams {
         IH2Market.SpreadParams memory spread = _spread();
 
         vm.startBroadcast();
-        address operator = vm.envOr("OPERATOR", msg.sender);
+        address operator = _operator();
         require(operator != address(0), "OPERATOR zero");
-        if (bootstrap > 0) {
-            require(IERC20(usdm).balanceOf(msg.sender) >= bootstrap * n, "deployer lacks BOOTSTRAP_USDM * n");
-        }
+        _preflight(usdm, operator, bootstrap * n, tokens);
 
         H2Oracle oracle = new H2Oracle();
         H2Market market = new H2Market(usdm, address(oracle));
@@ -146,10 +126,35 @@ contract DeployH2Mainnet is H2MainnetParams {
         return address(new BuilderRegistry(_stakeToken(), _minStake()));
     }
 
-    /// A fallback feed that has never answered (or answers <= 0) would misprice every fallback fill.
+    /// What the chain must already hold before the first transaction. View calls only, so nothing
+    /// here is broadcast.
+    function _preflight(address usdm, address operator, uint256 seedTotal, address[] memory tokens)
+        internal view
+    {
+        console2.log("preflight");
+        console2.log("  deployer ETH (wei)  ", msg.sender.balance);
+        console2.log("  operator ETH (wei)  ", operator.balance);
+        if (operator.balance < 0.002 ether) console2.log("  NOTE operator below 0.002 ETH: it cannot push marks until funded");
+        uint256 held = IERC20(usdm).balanceOf(msg.sender);
+        console2.log("  deployer USDM       ", held);
+        console2.log("  seed needed         ", seedTotal);
+        require(held >= seedTotal, "deployer lacks the USDM seed (BOOTSTRAP_USDM * markets)");
+        // USDm's issuer can blacklist; absent on other tokens, so a missing function is fine.
+        try IBlacklistable(usdm).isBlacklisted(msg.sender) returns (bool listed) {
+            require(!listed, "deployer is blacklisted on the settlement token");
+        } catch {}
+        for (uint256 i = 0; i < tokens.length; i++) {
+            require(tokens[i] != address(0) && tokens[i].code.length > 0, "market token has no code");
+        }
+    }
+
+    /// A fallback feed that has never answered, answers <= 0, or is more than a minute off the
+    /// block time would misprice every fallback fill. RedStone stamps updatedAt in microseconds.
     function _assertFresh(address feed) internal view {
         (, int256 answer, , uint256 updatedAt, ) = IAggregatorV3(feed).latestRoundData();
         require(answer > 0, "fallback feed answer <= 0");
         require(updatedAt > 0, "fallback feed never updated");
+        uint256 t = updatedAt > 1e14 ? updatedAt / 1e6 : updatedAt > 1e11 ? updatedAt / 1e3 : updatedAt;
+        require(t + 60 >= block.timestamp && t <= block.timestamp + 60, "fallback feed stale or future-stamped");
     }
 }
